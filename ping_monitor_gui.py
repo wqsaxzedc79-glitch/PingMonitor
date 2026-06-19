@@ -18,7 +18,8 @@ import threading
 import time
 import tkinter as tk
 import zlib
-from datetime import datetime, date
+from collections import deque
+from datetime import datetime, date, timedelta
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -198,6 +199,202 @@ class DayStats:
                 self.agent_stop, self.simul_fail]
 
 
+# ── 실시간 응답시간 그래프 ────────────────────────────────────────────
+class RTGraph:
+    """tkinter Canvas 기반 실시간 Ping 응답시간 그래프 (외부 라이브러리 불필요)."""
+
+    MAXLEN = 720        # 1시간 @ 5초 간격
+    C_BG   = "#1e1e2e"  # 배경
+    C_GRID = "#2a2a3e"  # 그리드
+    C_LINE = "#4fc3f7"  # 정상 선
+    C_WARN = "#ffb74d"  # 급증 구간 (주황)
+    C_FAIL = "#ef5350"  # FAIL 점
+    C_MARK = "#ffd54f"  # 최대값 마커
+    C_TEXT = "#90a4ae"  # 축 텍스트
+
+    def __init__(self, parent, title):
+        self._data = deque(maxlen=self.MAXLEN)  # (datetime, int|None)
+
+        outer = ttk.LabelFrame(parent, text=title, padding=4)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        self.cv = tk.Canvas(outer, bg=self.C_BG,
+                            highlightthickness=1, highlightbackground="#444")
+        self.cv.pack(fill=tk.BOTH, expand=True)
+
+        # 통계 바
+        sf = ttk.Frame(outer)
+        sf.pack(fill=tk.X, pady=(4, 0))
+        self._lbl = {}
+        for key, name in [("cur", "현재값"), ("max", "최대값"),
+                           ("min", "최소값"), ("avg", "평균값")]:
+            col = ttk.Frame(sf)
+            col.pack(side=tk.LEFT, expand=True)
+            ttk.Label(col, text=name, font=("", 8),
+                      foreground="#888888").pack()
+            v = ttk.Label(col, text="—", font=("", 9, "bold"))
+            v.pack()
+            self._lbl[key] = v
+
+        self.cv.bind("<Motion>",    self._on_move)
+        self.cv.bind("<Leave>",     self._on_leave)
+        self.cv.bind("<Configure>", lambda e: self._draw())
+
+    # ── 데이터 추가 (스레드 안전 — deque + GIL) ──────────────────────
+    def push(self, rt):
+        """rt: 응답시간(ms, int) 또는 None(FAIL)."""
+        self._data.append((datetime.now(), rt))
+
+    # ── 갱신 (반드시 메인 스레드에서 호출) ───────────────────────────
+    def refresh(self):
+        self._draw()
+        self._update_stats()
+
+    def _update_stats(self):
+        vals = [r for _, r in self._data if r is not None]
+        if not vals:
+            for lb in self._lbl.values():
+                lb.config(text="—")
+            return
+        self._lbl["cur"].config(text=f"{vals[-1]} ms")
+        self._lbl["max"].config(text=f"{max(vals)} ms")
+        self._lbl["min"].config(text=f"{min(vals)} ms")
+        self._lbl["avg"].config(
+            text=f"{round(sum(vals) / len(vals))} ms")
+
+    def _margins(self):
+        return 44, 8, 10, 24   # left, right, top, bottom
+
+    def _draw(self):
+        c = self.cv
+        c.delete("graph")
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 30 or H < 30:
+            return
+        ML, MR, MT, MB = self._margins()
+        gW, gH = W - ML - MR, H - MT - MB
+
+        data = list(self._data)   # 스냅샷 (thread-safe with GIL)
+        n    = len(data)
+        vals = [r for _, r in data if r is not None]
+
+        if not data:
+            c.create_text(W // 2, H // 2, text="데이터 대기 중...",
+                          fill=self.C_TEXT, font=("", 9), tags="graph")
+            return
+
+        if not vals:
+            c.create_text(W // 2, H // 2, text="FAIL 연속 발생",
+                          fill=self.C_FAIL, font=("", 9, "bold"), tags="graph")
+            return
+
+        y_max = max(max(vals) * 1.3, 10)
+
+        # ── Y축 그리드 ───────────────────────────────────────
+        for i in range(5):
+            frac = i / 4
+            yp   = MT + gH - int(gH * frac)
+            c.create_line(ML, yp, ML + gW, yp,
+                          fill=self.C_GRID, width=1, tags="graph")
+            c.create_text(ML - 3, yp, text=f"{round(y_max * frac)}",
+                          fill=self.C_TEXT, font=("", 7),
+                          anchor=tk.E, tags="graph")
+
+        # ── X축 시간 레이블 ───────────────────────────────────
+        for frac, anc in [(0, tk.W), (0.5, tk.CENTER), (1, tk.E)]:
+            idx = int(frac * (n - 1))
+            xp  = ML + int(gW * frac)
+            c.create_text(xp, MT + gH + 10,
+                          text=data[idx][0].strftime("%H:%M:%S"),
+                          fill=self.C_TEXT, font=("", 7),
+                          anchor=anc, tags="graph")
+
+        # ── 응답시간 선 + FAIL 점 ────────────────────────────
+        prev_x = prev_y = prev_rt = None
+        max_rt  = max(vals)
+        max_idx = max(range(n), key=lambda i: data[i][1] or -1)
+
+        for i, (ts, rt) in enumerate(data):
+            xp = ML + int(gW * i / max(n - 1, 1))
+
+            if rt is not None:
+                yp = MT + gH - int(gH * rt / y_max)
+                yp = max(MT, min(MT + gH, yp))
+
+                if prev_x is not None and prev_rt is not None:
+                    # 50% 이상 급증 → 주황색 강조
+                    color = (self.C_WARN if rt > prev_rt * 1.5
+                             else self.C_LINE)
+                    c.create_line(prev_x, prev_y, xp, yp,
+                                  fill=color, width=1.5,
+                                  smooth=True, tags="graph")
+
+                # 최대값 마커 (노란 원 + 텍스트)
+                if i == max_idx:
+                    c.create_oval(xp - 4, yp - 4, xp + 4, yp + 4,
+                                  fill=self.C_MARK, outline="",
+                                  tags="graph")
+                    c.create_text(xp, yp - 10, text=f"{rt}ms",
+                                  fill=self.C_MARK, font=("", 7, "bold"),
+                                  tags="graph")
+
+                prev_x, prev_y, prev_rt = xp, yp, rt
+
+            else:
+                # FAIL 빨간 점
+                yp = MT + gH // 2
+                c.create_oval(xp - 5, yp - 5, xp + 5, yp + 5,
+                               fill=self.C_FAIL, outline="#ff8a80",
+                               width=1, tags="graph")
+                prev_x, prev_y, prev_rt = xp, yp, None
+
+        # ── 축선 ─────────────────────────────────────────────
+        c.create_line(ML, MT, ML, MT + gH + 1,
+                      fill="#555555", tags="graph")
+        c.create_line(ML, MT + gH, ML + gW, MT + gH,
+                      fill="#555555", tags="graph")
+
+    # ── 마우스 오버: 십자선 + 툴팁 ────────────────────────────────
+    def _on_move(self, event):
+        c = self.cv
+        c.delete("hover")
+        if not self._data:
+            return
+        W, H = c.winfo_width(), c.winfo_height()
+        ML, MR, MT, MB = self._margins()
+        gW = W - ML - MR
+
+        x_rel = event.x - ML
+        if x_rel < 0 or x_rel > gW:
+            return
+
+        data = list(self._data)
+        n    = len(data)
+        idx  = max(0, min(int(x_rel / max(gW, 1) * (n - 1)), n - 1))
+        ts, rt = data[idx]
+        xp = ML + int(gW * idx / max(n - 1, 1))
+
+        # 수직 십자선
+        c.create_line(xp, MT, xp, MT + H - MT - MB,
+                      fill="#ffffff", width=1,
+                      dash=(3, 3), tags="hover")
+
+        # 툴팁 박스
+        rt_text = f"{rt} ms" if rt is not None else "FAIL"
+        tip     = f"{ts.strftime('%Y-%m-%d %H:%M:%S')}\n{rt_text}"
+        tx = min(xp + 10, W - 100)
+        ty = max(event.y - 38, MT + 2)
+        c.create_rectangle(tx - 2, ty - 2, tx + 96, ty + 30,
+                            fill="#2a2a4a", outline="#6666bb",
+                            width=1, tags="hover")
+        c.create_text(tx + 47, ty + 14, text=tip,
+                      fill="#e0e8ff", font=("", 8),
+                      justify=tk.CENTER, tags="hover")
+
+    def _on_leave(self, event):
+        self.cv.delete("hover")
+
+
 # ── 대상 추가/수정 다이얼로그 ─────────────────────────────────────────
 class TargetDialog(tk.Toplevel):
     def __init__(self, parent, name="", ip="", title="대상 추가"):
@@ -246,7 +443,7 @@ class PingMonitorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("핑감지 테스트기 v2")
-        self.root.geometry("1060x780")
+        self.root.geometry("1060x920")
         self.root.minsize(860, 620)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -254,8 +451,9 @@ class PingMonitorApp:
         self._running  = False
         self._threads  = []
         self._lock     = threading.Lock()
-        self._interval = tk.IntVar(value=5)
-        self._log_dir  = tk.StringVar(value=_default_log_dir())
+        self._interval       = tk.IntVar(value=5)
+        self._log_dir        = tk.StringVar(value=_default_log_dir())
+        self._retention_days = tk.IntVar(value=30)  # 로그 보관 기간(일)
         self._stats    = DayStats()
 
         # NC Agent 상태
@@ -278,6 +476,8 @@ class PingMonitorApp:
 
         # 대시보드 위젯 참조
         self._dash = {}
+        self._graph_equip  = None   # RTGraph — 설비 Ping
+        self._graph_server = None   # RTGraph — 서버 Ping
 
         self._build_ui()
         self._load_config()
@@ -290,7 +490,8 @@ class PingMonitorApp:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump({"targets": self._targets,
                            "log_dir": self._log_dir.get(),
-                           "interval": self._interval.get()},
+                           "interval": self._interval.get(),
+                           "retention_days": self._retention_days.get()},
                           f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -313,6 +514,8 @@ class PingMonitorApp:
                 # 드라이브가 없으면 기본값(logs 폴더) 유지
             if isinstance(d.get("interval"), int) and 1 <= d["interval"] <= 300:
                 self._interval.set(d["interval"])
+            if isinstance(d.get("retention_days"), int) and 1 <= d["retention_days"] <= 365:
+                self._retention_days.set(d["retention_days"])
         except Exception:
             pass
 
@@ -430,6 +633,20 @@ class PingMonitorApp:
                                        command=self._browse_log_dir, width=9)
         self._browse_btn.pack(side=tk.LEFT)
 
+        # 로그 보관 기간
+        ar = ttk.Frame(left)
+        ar.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(ar, text="로그 보관:").pack(side=tk.LEFT)
+        ttk.Spinbox(ar, from_=1, to=365, textvariable=self._retention_days,
+                    width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(ar, text="일 경과 시 archive 폴더로 자동 이동").pack(side=tk.LEFT, padx=2)
+        self._archive_btn = ttk.Button(ar, text="지금 정리",
+                                        command=self._run_archive_now, width=9)
+        self._archive_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._archive_status = ttk.Label(ar, text="", foreground="#555555",
+                                          font=("", 8))
+        self._archive_status.pack(side=tk.LEFT, padx=4)
+
         # 시작/중지 버튼
         ctrl = ttk.Frame(frm)
         ctrl.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
@@ -524,6 +741,19 @@ class PingMonitorApp:
                       text="  psutil 미설치: NC Agent / 네트워크 어댑터 기능 비활성화  "
                            "(pip install psutil)",
                       foreground="#cc6600", relief=tk.GROOVE).pack(pady=6, padx=12)
+
+        # ── 실시간 응답시간 그래프 ─────────────────────────────────────
+        gp = tk.PanedWindow(parent, orient=tk.VERTICAL,
+                             sashrelief=tk.RIDGE, sashwidth=6,
+                             bg="#888888")
+        gp.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 6))
+
+        for attr, lbl in [("_graph_equip",  "설비 Ping 응답시간 (ms)"),
+                           ("_graph_server", "서버 Ping 응답시간 (ms)")]:
+            f = ttk.Frame(gp)
+            gp.add(f, minsize=170)
+            graph = RTGraph(f, lbl)
+            setattr(self, attr, graph)
 
     # ── 로그 탭들 ────────────────────────────────────────────────────
     def _build_ping_tab(self, parent):
@@ -1298,7 +1528,14 @@ class PingMonitorApp:
 
                 self.root.after(0, _upd)
 
+                # 그래프 데이터 push (첫 두 대상만)
+                if i == 0 and self._graph_equip:
+                    self._graph_equip.push(rt)
+                elif i == 1 and self._graph_server:
+                    self._graph_server.push(rt)
+
             self.root.after(0, self._refresh_stat_labels)
+            self.root.after(0, self._refresh_graphs)
             self._check_day_rollover()
 
             if self._running:
@@ -1376,6 +1613,121 @@ class PingMonitorApp:
         except (tk.TclError, KeyError):
             pass
 
+    # ── 로그 자동 정리 ────────────────────────────────────────────────
+    _ARCHIVE_TARGETS = [
+        ("ping_log.csv",    "H_PING"),
+        ("process_log.csv", "H_PROC"),
+        ("network_log.csv", "H_NET"),
+        ("event_log.csv",   "H_EVT"),
+        ("fail_log.csv",    "H_FAULT"),
+    ]
+
+    def _archive_old_logs(self):
+        """보관 기간이 지난 로그 항목을 archive 폴더로 이동."""
+        days    = self._retention_days.get()
+        cutoff  = datetime.now() - timedelta(days=days)
+        arc_dir = os.path.join(self._ld, "archive")
+
+        total_archived = 0
+
+        for fname, hdr_name in self._ARCHIVE_TARGETS:
+            src = os.path.join(self._ld, fname)
+            if not os.path.exists(src):
+                continue
+
+            hdr = globals().get(hdr_name, [])
+
+            try:
+                with open(src, "r", encoding="utf-8-sig", newline="") as f:
+                    reader = csv.reader(f)
+                    file_hdr = next(reader, [])
+                    rows     = list(reader)
+            except Exception:
+                continue
+
+            old_rows, new_rows = [], []
+            for row in rows:
+                if not row:
+                    continue
+                try:
+                    dt = datetime.strptime(row[0][:19], "%Y-%m-%d %H:%M:%S")
+                    (old_rows if dt < cutoff else new_rows).append(row)
+                except (ValueError, IndexError):
+                    new_rows.append(row)
+
+            if not old_rows:
+                continue
+
+            os.makedirs(arc_dir, exist_ok=True)
+
+            # 월별로 묶어서 archive 저장
+            monthly = {}
+            for row in old_rows:
+                try:
+                    month = row[0][:7].replace("-", "")   # YYYYMM
+                    monthly.setdefault(month, []).append(row)
+                except Exception:
+                    pass
+
+            for month, m_rows in monthly.items():
+                arc_name = f"{fname.replace('.csv', '')}_{month}.csv"
+                arc_path = os.path.join(arc_dir, arc_name)
+                exists   = os.path.exists(arc_path)
+                with open(arc_path, "a", newline="", encoding="utf-8-sig") as f:
+                    w = csv.writer(f)
+                    if not exists:
+                        w.writerow(hdr or file_hdr)
+                    w.writerows(m_rows)
+
+            # 원본 파일을 최신 항목만 남기고 재작성
+            with open(src, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(file_hdr or hdr)
+                w.writerows(new_rows)
+
+            total_archived += len(old_rows)
+
+        return total_archived
+
+    def _run_archive_now(self):
+        """'지금 정리' 버튼 → 별도 스레드에서 실행."""
+        self._archive_btn.config(state=tk.DISABLED)
+        self._archive_status.config(text="정리 중...")
+
+        def _do():
+            try:
+                n = self._archive_old_logs()
+                msg = (f"{n}건 아카이브 완료" if n > 0
+                       else "이동할 항목 없음")
+            except Exception as e:
+                msg = f"오류: {e}"
+            self.root.after(0, lambda m=msg: (
+                self._archive_status.config(text=m),
+                self._archive_btn.config(state=tk.NORMAL),
+            ))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _archive_loop(self):
+        """시작 후 1분 대기, 이후 24시간마다 자동 정리."""
+        time.sleep(60)
+        while self._running:
+            self._archive_old_logs()
+            self.root.after(0, lambda: self._archive_status.config(
+                text=f"마지막 자동 정리: {datetime.now().strftime('%m-%d %H:%M')}"))
+            for _ in range(1440):       # 24시간 = 1440분
+                if not self._running:
+                    return
+                time.sleep(60)
+
+    def _refresh_graphs(self):
+        """그래프 갱신 — 메인 스레드에서 호출."""
+        try:
+            if self._graph_equip:  self._graph_equip.refresh()
+            if self._graph_server: self._graph_server.refresh()
+        except tk.TclError:
+            pass
+
     def _safe_status(self, text):
         try:
             self._status_bar.config(text=text)
@@ -1406,8 +1758,10 @@ class PingMonitorApp:
         self._log_entry.config(state=tk.DISABLED)
         self._browse_btn.config(state=tk.DISABLED)
 
+        self._archive_btn.config(state=tk.DISABLED)
+
         for fn in [self._ping_loop, self._process_loop, self._network_loop,
-                   self._event_loop, self._ncagent_log_loop]:
+                   self._event_loop, self._ncagent_log_loop, self._archive_loop]:
             t = threading.Thread(target=fn, daemon=True)
             self._threads.append(t)
             t.start()
@@ -1433,6 +1787,7 @@ class PingMonitorApp:
         self._edt_btn.config(state=tk.NORMAL)
         self._log_entry.config(state=tk.NORMAL)
         self._browse_btn.config(state=tk.NORMAL)
+        self._archive_btn.config(state=tk.NORMAL)
 
     def _on_close(self):
         self._running = False
