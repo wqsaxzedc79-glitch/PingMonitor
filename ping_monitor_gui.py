@@ -1,0 +1,1547 @@
+"""
+ping_monitor_gui.py — 핑감지 테스트기 v2
+NC Agent 네트워크 종합 분석 도구
+"""
+
+import base64
+import csv
+import glob
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import zlib
+from datetime import datetime, date
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    import psutil
+    PSUTIL_OK = True
+except ImportError:
+    PSUTIL_OK = False
+
+# ── 상수 ─────────────────────────────────────────────────────────────
+NCAGENT_EXE = "NCAgent.exe"
+CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+H_PING   = ["DateTime", "Target", "Status", "ResponseTime_ms"]
+H_PROC   = ["DateTime", "PID", "CPU_pct", "Memory_MB", "Event"]
+H_NET    = ["DateTime", "Adapter", "Event", "IP", "Gateway"]
+H_EVT    = ["DateTime", "Source", "EventID", "Level", "Message"]
+H_FAULT  = ["DateTime", "Type", "Cause", "Detail"]
+H_REPORT = ["Date", "Total_Ping", "Total_Fail", "Equip_Fail", "Server_Fail",
+            "Max_RT_ms", "Avg_RT_ms", "Agent_Stop", "Simul_Fail"]
+
+DEFAULT_TARGETS = [("설비 IP", "192.168.0.101"), ("서버", "hidc.cps.org")]
+
+EVT_PROVIDERS = [
+    "Tcpip", "DNS Client Events", "Service Control Manager",
+    "Microsoft-Windows-Kernel-PnP", "Microsoft-Windows-NDIS",
+    "e1000e", "RTL8153", "Realtek", "USB",
+]
+
+NC_SEARCH = [
+    r"C:\Program Files\NCAgent", r"C:\Program Files (x86)\NCAgent",
+    r"C:\NCAgent", r"D:\NCAgent",
+    r"C:\HI-CPS",  r"C:\Program Files\HI-CPS", r"C:\Program Files (x86)\HI-CPS",
+]
+
+# ── 장애 원인 추정 매트릭스 ──────────────────────────────────────────
+# (제목, 상황 설명, 권장 조치, 색상)
+CAUSE_MATRIX = {
+    "link_down": (
+        "랜카드 / 케이블 연결 문제",
+        "네트워크 어댑터 Link Down 감지\n"
+        "→ PC가 네트워크에서 완전히 분리된 상태입니다.",
+        "① 랜 케이블 연결 상태 확인\n"
+        "② 스위치·허브 전원 및 포트 확인\n"
+        "③ 네트워크 어댑터 드라이버 상태 확인",
+        "#cc0000",
+    ),
+    "all_fail": (
+        "로컬 네트워크 전체 장애",
+        "설비 Ping 실패  +  서버 Ping 실패\n"
+        "→ PC 자체의 네트워크 연결 또는 공용 스위치/라우터 문제 가능성이 높습니다.",
+        "① 공유기·스위치 전원 재시작\n"
+        "② PC 네트워크 설정 확인 (IP / 게이트웨이)\n"
+        "③ 다른 장비에서 Ping 가능한지 교차 확인",
+        "#cc0000",
+    ),
+    "equip_fail": (
+        "사내 네트워크 또는 스위치 문제",
+        "설비 Ping 실패  /  서버 Ping 정상\n"
+        "→ 설비와 PC 사이의 내부 네트워크(스위치, 케이블, 설비 IP) 문제 가능성이 높습니다.",
+        "① 설비 IP 주소 및 전원 상태 확인\n"
+        "② 설비↔PC 구간 스위치 포트·케이블 확인\n"
+        "③ 설비 측 네트워크 설정 확인",
+        "#cc6600",
+    ),
+    "server_fail": (
+        "서버 통신 문제 가능성 높음",
+        "설비 Ping 정상  /  서버 Ping 실패\n"
+        "→ 외부 서버(hidc.cps.org)와의 WAN/인터넷 통신 문제 가능성이 높습니다.",
+        "① 인터넷(WAN) 연결 상태 확인\n"
+        "② hidc.cps.org 서버 운영 상태 문의\n"
+        "③ DNS 설정 및 방화벽 규칙 확인",
+        "#cc6600",
+    ),
+    "agent_only": (
+        "NC Agent 프로그램 문제",
+        "Ping 정상  +  NC Agent 프로세스 종료\n"
+        "→ NC Agent 프로그램 자체의 오류 또는 비정상 종료 가능성이 높습니다.",
+        "① NC Agent 로그 파일 내용 확인\n"
+        "② NC Agent 재시작\n"
+        "③ Windows 이벤트 로그에서 오류 확인",
+        "#cc6600",
+    ),
+    "normal": (
+        "정상",
+        "현재 감지된 장애 없음\n→ 모든 시스템이 정상 동작 중입니다.",
+        "",
+        "#006600",
+    ),
+}
+
+
+# ── 헬퍼 ─────────────────────────────────────────────────────────────
+# PyInstaller exe 실행 시에는 sys.executable 기준, 일반 .py 실행 시에는 __file__ 기준
+if getattr(sys, 'frozen', False):
+    _SCRIPT_DIR = os.path.dirname(sys.executable)
+else:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _default_log_dir():
+    """항상 스크립트 폴더 안의 logs 폴더를 기본 경로로 사용."""
+    return os.path.join(_SCRIPT_DIR, "logs")
+
+
+def _find_ncagent_dir():
+    if PSUTIL_OK:
+        try:
+            for p in psutil.process_iter(["name", "exe"]):
+                if p.info.get("name", "").lower() == NCAGENT_EXE.lower():
+                    exe = p.info.get("exe", "")
+                    if exe:
+                        d = os.path.dirname(exe)
+                        lg = os.path.join(d, "Log")
+                        return lg if os.path.isdir(lg) else d
+        except Exception:
+            pass
+    for base in NC_SEARCH:
+        if not os.path.isdir(base):
+            continue
+        for sub in ("Log", "log", "Logs", ""):
+            p = os.path.join(base, sub) if sub else base
+            if os.path.isdir(p) and glob.glob(os.path.join(p, "*.log")):
+                return p
+        return base
+    try:
+        import winreg
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for sub in (r"SOFTWARE\NCAgent", r"SOFTWARE\HI-CPS\NCAgent",
+                        r"SOFTWARE\WOW6432Node\NCAgent"):
+                try:
+                    k = winreg.OpenKey(hive, sub)
+                    path, _ = winreg.QueryValueEx(k, "InstallPath")
+                    if os.path.isdir(path):
+                        return path
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+# ── 일별 통계 ─────────────────────────────────────────────────────────
+class DayStats:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.date        = date.today()
+        self.total_ping  = 0
+        self.equip_fail  = 0
+        self.server_fail = 0
+        self.agent_stop  = 0
+        self.net_error   = 0
+        self.max_rt      = 0    # 최대 응답시간(ms)
+        self.sum_rt      = 0    # 응답시간 합계 (평균 계산용)
+        self.rt_count    = 0    # 응답 성공 횟수
+        self.simul_fail  = 0    # 동시 장애 횟수 (전체 대상 동시 FAIL)
+
+    @property
+    def total_fail(self):
+        return self.equip_fail + self.server_fail
+
+    @property
+    def avg_rt(self):
+        return round(self.sum_rt / self.rt_count, 1) if self.rt_count > 0 else 0
+
+    def snapshot(self):
+        """현재 통계의 복사본 반환 (리셋 전 보고서 생성용)."""
+        s = DayStats.__new__(DayStats)
+        s.__dict__.update(self.__dict__)
+        return s
+
+    def to_row(self):
+        return [str(self.date), self.total_ping, self.total_fail,
+                self.equip_fail, self.server_fail,
+                self.max_rt, self.avg_rt,
+                self.agent_stop, self.simul_fail]
+
+
+# ── 대상 추가/수정 다이얼로그 ─────────────────────────────────────────
+class TargetDialog(tk.Toplevel):
+    def __init__(self, parent, name="", ip="", title="대상 추가"):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.result = None
+        self.grab_set()
+        self.transient(parent)
+
+        ttk.Label(self, text="이름 (표시용):").grid(row=0, column=0, sticky=tk.W, padx=12, pady=8)
+        self._name = tk.StringVar(value=name)
+        ttk.Entry(self, textvariable=self._name, width=26).grid(row=0, column=1, padx=12, pady=8)
+
+        ttk.Label(self, text="IP / 호스트명:").grid(row=1, column=0, sticky=tk.W, padx=12, pady=8)
+        self._ip = tk.StringVar(value=ip)
+        e = ttk.Entry(self, textvariable=self._ip, width=26)
+        e.grid(row=1, column=1, padx=12, pady=8)
+        e.focus_set()
+
+        ttk.Separator(self, orient=tk.HORIZONTAL).grid(
+            row=2, column=0, columnspan=2, sticky=tk.EW, padx=12)
+        f = ttk.Frame(self)
+        f.grid(row=3, column=0, columnspan=2, pady=10)
+        ttk.Button(f, text="확인", command=self._ok, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Button(f, text="취소", command=self.destroy, width=10).pack(side=tk.LEFT, padx=5)
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        px = parent.winfo_x() + (parent.winfo_width()  - self.winfo_width())  // 2
+        py = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{px}+{py}")
+
+    def _ok(self):
+        ip = self._ip.get().strip()
+        if not ip:
+            messagebox.showwarning("입력 오류", "IP 또는 호스트명을 입력하세요.", parent=self)
+            return
+        self.result = (self._name.get().strip() or ip, ip)
+        self.destroy()
+
+
+# ── 메인 애플리케이션 ─────────────────────────────────────────────────
+class PingMonitorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("핑감지 테스트기 v2")
+        self.root.geometry("1060x780")
+        self.root.minsize(860, 620)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._targets  = list(DEFAULT_TARGETS)
+        self._running  = False
+        self._threads  = []
+        self._lock     = threading.Lock()
+        self._interval = tk.IntVar(value=5)
+        self._log_dir  = tk.StringVar(value=_default_log_dir())
+        self._stats    = DayStats()
+
+        # NC Agent 상태
+        self._ncagent_dir        = None
+        self._ncagent_pid        = None
+        self._ncagent_was_up     = None
+        self._ncagent_log_mtimes = {}
+
+        # 네트워크 이전 상태
+        self._prev_if_up  = {}
+        self._prev_if_ips = {}
+        self._prev_gw     = None
+
+        # 이벤트 로그 마지막 수집 시간
+        self._last_evt_collect = datetime.now()
+
+        # 장애 지속시간 추적
+        self._fail_start = {}    # host -> datetime (FAIL 시작 시각)
+        self._prev_ok    = {}    # host -> bool     (직전 핑 결과)
+
+        # 대시보드 위젯 참조
+        self._dash = {}
+
+        self._build_ui()
+        self._load_config()
+        self._reload_target_tree()
+        self._update_clock()
+
+    # ── 설정 저장/불러오기 ────────────────────────────────────────────
+    def _save_config(self):
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump({"targets": self._targets,
+                           "log_dir": self._log_dir.get(),
+                           "interval": self._interval.get()},
+                          f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _load_config(self):
+        if not os.path.exists(CONFIG_FILE):
+            return
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d.get("targets"), list) and d["targets"]:
+                self._targets = [tuple(t) for t in d["targets"]]
+            saved_dir = d.get("log_dir", "").strip()
+            if saved_dir:
+                # 절대경로인 경우 해당 드라이브/루트가 이 PC에 존재할 때만 사용
+                drive = os.path.splitdrive(saved_dir)[0]
+                drive_ok = (not drive) or os.path.exists(drive + os.sep)
+                if drive_ok:
+                    self._log_dir.set(saved_dir)
+                # 드라이브가 없으면 기본값(logs 폴더) 유지
+            if isinstance(d.get("interval"), int) and 1 <= d["interval"] <= 300:
+                self._interval.set(d["interval"])
+        except Exception:
+            pass
+
+    # ── 로그 경로 프로퍼티 ────────────────────────────────────────────
+    @property
+    def _ld(self):           return self._log_dir.get()
+    @property
+    def _ping_path(self):    return os.path.join(self._ld, "ping_log.csv")
+    @property
+    def _fault_path(self):   return os.path.join(self._ld, "fail_log.csv")
+    @property
+    def _proc_path(self):    return os.path.join(self._ld, "process_log.csv")
+    @property
+    def _net_path(self):     return os.path.join(self._ld, "network_log.csv")
+    @property
+    def _evt_path(self):     return os.path.join(self._ld, "event_log.csv")
+    @property
+    def _report_path(self):  return os.path.join(self._ld, "daily_report.csv")
+
+    def _ensure_logs(self):
+        os.makedirs(self._ld, exist_ok=True)
+        for path, hdr in [(self._ping_path,   H_PING),
+                          (self._fault_path,  H_FAULT),
+                          (self._proc_path,   H_PROC),
+                          (self._net_path,    H_NET),
+                          (self._evt_path,    H_EVT),
+                          (self._report_path, H_REPORT)]:
+            if not os.path.exists(path):
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    csv.writer(f).writerow(hdr)
+
+    @staticmethod
+    def _wcsv(path, row):
+        with open(path, "a", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(row)
+
+    def _append_ui(self, tree, values, tag=None):
+        try:
+            kw = {"tags": (tag,)} if tag else {}
+            tree.insert("", 0, values=values, **kw)
+            kids = tree.get_children()
+            if len(kids) > 2000:
+                tree.delete(kids[-1])
+        except tk.TclError:
+            pass
+
+    # ── UI 구성 ───────────────────────────────────────────────────────
+    def _build_ui(self):
+        self._build_settings_strip()
+        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=3)
+
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+
+        for label, builder in [
+            ("  대시보드  ",      self._build_dashboard_tab),
+            ("  Ping 로그  ",     self._build_ping_tab),
+            ("  프로세스  ",      self._build_process_tab),
+            ("  네트워크  ",      self._build_network_tab),
+            ("  이벤트 로그  ",   self._build_event_tab),
+            ("  NC Agent 로그  ", self._build_ncagent_log_tab),
+            ("  장애 분석  ",     self._build_fault_tab),
+        ]:
+            f = ttk.Frame(nb)
+            nb.add(f, text=label)
+            builder(f)
+
+        self._status_bar = ttk.Label(self.root, text="대기 중...",
+                                      relief=tk.SUNKEN, anchor=tk.W)
+        self._status_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(2, 4))
+
+    # ── 설정 스트립 ───────────────────────────────────────────────────
+    def _build_settings_strip(self):
+        frm = ttk.LabelFrame(self.root, text="설정", padding=6)
+        frm.pack(fill=tk.X, padx=8, pady=(8, 0))
+
+        left = ttk.Frame(frm)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # IP 목록 트리
+        tf = ttk.Frame(left)
+        tf.pack(fill=tk.X)
+        self._target_tree = ttk.Treeview(tf, columns=("name", "ip"),
+                                          show="headings", height=3, selectmode="browse")
+        self._target_tree.heading("name", text="이름")
+        self._target_tree.heading("ip",   text="IP / 호스트")
+        self._target_tree.column("name",  width=90,  anchor=tk.W)
+        self._target_tree.column("ip",    width=160, anchor=tk.W)
+        self._target_tree.bind("<Double-1>", lambda e: self._edit_target())
+        sb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self._target_tree.yview)
+        self._target_tree.configure(yscrollcommand=sb.set)
+        self._target_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 버튼 행
+        br = ttk.Frame(left)
+        br.pack(fill=tk.X, pady=(4, 0))
+        self._add_btn = ttk.Button(br, text="+ 추가", command=self._add_target, width=7)
+        self._del_btn = ttk.Button(br, text="- 삭제", command=self._del_target, width=7)
+        self._edt_btn = ttk.Button(br, text="수정",   command=self._edit_target, width=7)
+        self._add_btn.pack(side=tk.LEFT, padx=2)
+        self._del_btn.pack(side=tk.LEFT, padx=2)
+        self._edt_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Label(br, text="  간격:").pack(side=tk.LEFT)
+        ttk.Spinbox(br, from_=1, to=300, textvariable=self._interval, width=4).pack(side=tk.LEFT)
+        ttk.Label(br, text="초").pack(side=tk.LEFT)
+
+        # 로그 경로
+        lr = ttk.Frame(left)
+        lr.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(lr, text="로그 경로:").pack(side=tk.LEFT)
+        self._log_entry = ttk.Entry(lr, textvariable=self._log_dir)
+        self._log_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self._browse_btn = ttk.Button(lr, text="폴더 선택",
+                                       command=self._browse_log_dir, width=9)
+        self._browse_btn.pack(side=tk.LEFT)
+
+        # 시작/중지 버튼
+        ctrl = ttk.Frame(frm)
+        ctrl.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        self._start_btn = ttk.Button(ctrl, text="▶  시작", command=self._start, width=14)
+        self._stop_btn  = ttk.Button(ctrl, text="■  중지", command=self._stop, width=14,
+                                      state=tk.DISABLED)
+        self._start_btn.pack(pady=4)
+        self._stop_btn.pack(pady=4)
+
+    # ── 대시보드 탭 ───────────────────────────────────────────────────
+    def _build_dashboard_tab(self, parent):
+        # ── 상단 바: 현재 시간 + LED 인디케이터 ──────────────────────
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X, padx=12, pady=(8, 4))
+        ttk.Label(top, text="현재 시간:", font=("", 10, "bold")).pack(side=tk.LEFT)
+        self._dash["time"] = ttk.Label(top, text="-", font=("", 10))
+        self._dash["time"].pack(side=tk.LEFT, padx=6)
+
+        # Power / Status LED
+        led_frm = ttk.LabelFrame(top, text="시스템", padding=4)
+        led_frm.pack(side=tk.RIGHT, padx=6)
+        # ttk 위젯은 background 직접 조회 불가 → 시스템 기본색 사용
+        _bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        for lbl, key, init_color in [
+            ("Power",  "led_power",  "#888888"),
+            ("Status", "led_status", "#888888"),
+        ]:
+            f = ttk.Frame(led_frm)
+            f.pack(side=tk.LEFT, padx=10)
+            cv = tk.Canvas(f, width=26, height=26,
+                           highlightthickness=0, bg=_bg)
+            cv.create_oval(3, 3, 23, 23, fill=init_color,
+                           outline="#444444", width=1, tags="led")
+            cv.pack()
+            ttk.Label(f, text=lbl, font=("", 8, "bold")).pack()
+            self._dash[key] = cv
+
+        # 실시간 상태 카드 3개
+        card_frm = ttk.LabelFrame(parent, text="실시간 상태", padding=8)
+        card_frm.pack(fill=tk.X, padx=12, pady=4)
+
+        card_defs = [
+            ("설비 Ping",  "equip_status",  "equip_detail"),
+            ("서버 Ping",  "server_status", "server_detail"),
+            ("NC Agent",   "agent_status",  "agent_detail"),
+        ]
+        for i, (title, ks, kd) in enumerate(card_defs):
+            card = ttk.LabelFrame(card_frm, text=title, padding=8)
+            card.grid(row=0, column=i, padx=6, pady=2, sticky=tk.NSEW)
+            card_frm.columnconfigure(i, weight=1)
+            s = ttk.Label(card, text="-", font=("", 13, "bold"), width=12, anchor=tk.CENTER)
+            s.pack()
+            d = ttk.Label(card, text="-", font=("", 9), anchor=tk.CENTER)
+            d.pack()
+            self._dash[ks] = s
+            self._dash[kd] = d
+
+        # 네트워크 어댑터
+        net = ttk.LabelFrame(parent, text="네트워크 어댑터", padding=8)
+        net.pack(fill=tk.X, padx=12, pady=4)
+        r1 = ttk.Frame(net)
+        r1.pack(fill=tk.X)
+        ttk.Label(r1, text="어댑터:").pack(side=tk.LEFT)
+        self._dash["if_name"]   = ttk.Label(r1, text="-", width=32); self._dash["if_name"].pack(side=tk.LEFT, padx=4)
+        self._dash["if_status"] = ttk.Label(r1, text="-", width=12); self._dash["if_status"].pack(side=tk.LEFT, padx=4)
+        r2 = ttk.Frame(net)
+        r2.pack(fill=tk.X, pady=2)
+        ttk.Label(r2, text="IP:").pack(side=tk.LEFT)
+        self._dash["if_ip"] = ttk.Label(r2, text="-", width=20); self._dash["if_ip"].pack(side=tk.LEFT, padx=4)
+        ttk.Label(r2, text="  GW:").pack(side=tk.LEFT)
+        self._dash["if_gw"] = ttk.Label(r2, text="-", width=16); self._dash["if_gw"].pack(side=tk.LEFT, padx=4)
+
+        # 오늘 통계
+        stat = ttk.LabelFrame(parent, text="오늘 통계", padding=8)
+        stat.pack(fill=tk.X, padx=12, pady=4)
+        stat_row = ttk.Frame(stat)
+        stat_row.pack(fill=tk.X)
+        for i, (lbl, key) in enumerate([("총 Ping", "s_ping"),
+                                          ("설비 실패", "s_equip"),
+                                          ("서버 실패", "s_server"),
+                                          ("Agent 종료", "s_agent"),
+                                          ("네트워크 오류", "s_net")]):
+            col = ttk.Frame(stat_row)
+            col.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=6)
+            ttk.Label(col, text=lbl, font=("", 8), foreground="#666666").pack()
+            v = ttk.Label(col, text="0", font=("", 18, "bold"), anchor=tk.CENTER)
+            v.pack(fill=tk.X)
+            self._dash[key] = v
+
+        if not PSUTIL_OK:
+            ttk.Label(parent,
+                      text="  psutil 미설치: NC Agent / 네트워크 어댑터 기능 비활성화  "
+                           "(pip install psutil)",
+                      foreground="#cc6600", relief=tk.GROOVE).pack(pady=6, padx=12)
+
+    # ── 로그 탭들 ────────────────────────────────────────────────────
+    def _build_ping_tab(self, parent):
+        self._ping_tree = self._make_tree(parent,
+            ("dt","target","status","rt"),
+            ("날짜/시간","대상","상태","응답시간(ms)"),
+            (155, 220, 70, 110))
+        self._add_save_bar(parent, self._ping_tree, "Ping 로그", "ping_log")
+
+    def _build_process_tab(self, parent):
+        ttk.Label(parent,
+            text=f"  감시 대상: {NCAGENT_EXE}  |  5초마다 확인",
+            foreground="#555555").pack(anchor=tk.W, pady=(6, 2))
+        self._proc_tree = self._make_tree(parent,
+            ("dt","pid","cpu","mem","event"),
+            ("날짜/시간","PID","CPU(%)","메모리(MB)","이벤트"),
+            (155, 80, 80, 100, 280))
+        self._add_save_bar(parent, self._proc_tree, "프로세스 로그", "process_log")
+        if not PSUTIL_OK:
+            ttk.Label(parent, text="  psutil 필요:  pip install psutil",
+                      foreground="#cc0000").pack(pady=4)
+
+    def _build_network_tab(self, parent):
+        ttk.Label(parent,
+            text="  Link Up/Down · IP 변경 · Gateway 변경 감지  |  5초마다 확인",
+            foreground="#555555").pack(anchor=tk.W, pady=(6, 2))
+        self._net_tree = self._make_tree(parent,
+            ("dt","adapter","event","ip","gw"),
+            ("날짜/시간","어댑터","이벤트","IP","Gateway"),
+            (155, 160, 110, 140, 120))
+        self._add_save_bar(parent, self._net_tree, "네트워크 로그", "network_log")
+        if not PSUTIL_OK:
+            ttk.Label(parent, text="  psutil 필요:  pip install psutil",
+                      foreground="#cc0000").pack(pady=4)
+
+    def _build_event_tab(self, parent):
+        ttk.Label(parent,
+            text="  수집: Tcpip / DNS / SCM / Kernel-PnP / NDIS / Realtek / RTL8153  |  60초마다 수집",
+            foreground="#555555").pack(anchor=tk.W, pady=(6, 2))
+        self._evt_tree = self._make_tree(parent,
+            ("dt","source","id","level","msg"),
+            ("날짜/시간","소스","EventID","수준","메시지"),
+            (155, 190, 70, 80, 380))
+        self._add_save_bar(parent, self._evt_tree, "이벤트 로그", "event_log")
+
+    def _build_ncagent_log_tab(self, parent):
+        info = ttk.LabelFrame(parent, text="NC Agent 설치 경로", padding=6)
+        info.pack(fill=tk.X, padx=8, pady=6)
+        r = ttk.Frame(info)
+        r.pack(fill=tk.X)
+        ttk.Label(r, text="경로:").pack(side=tk.LEFT)
+        self._ncagent_path_lbl = ttk.Label(r, text="모니터링 시작 후 자동 탐색",
+                                            foreground="#888888")
+        self._ncagent_path_lbl.pack(side=tk.LEFT, padx=6)
+
+        self._nclog_tree = self._make_tree(parent,
+            ("dt","fname","action"),
+            ("날짜/시간","파일명","처리 내용"),
+            (155, 260, 380))
+        self._add_save_bar(parent, self._nclog_tree, "NC Agent 로그", "ncagent_log")
+
+    def _build_fault_tab(self, parent):
+        # ── 원인 추정 패널 ────────────────────────────────────────────
+        est = ttk.LabelFrame(parent, text="원인 추정", padding=10)
+        est.pack(fill=tk.X, padx=8, pady=(6, 4))
+
+        # 상태 행 (좌측)
+        left = ttk.Frame(est)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
+
+        for key, label in [
+            ("ce_equip",   "설비 Ping"),
+            ("ce_server",  "서버 Ping"),
+            ("ce_agent",   "NC Agent"),
+            ("ce_network", "네트워크"),
+        ]:
+            row = ttk.Frame(left)
+            row.pack(fill=tk.X, pady=3)
+            ttk.Label(row, text=f"{label}:", width=11,
+                      font=("", 9, "bold"), anchor=tk.W).pack(side=tk.LEFT)
+            lbl = ttk.Label(row, text="—", width=12, font=("", 9))
+            lbl.pack(side=tk.LEFT)
+            self._dash[key] = lbl
+
+        # 구분선
+        ttk.Separator(est, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        # 추정 결과 (우측)
+        right = ttk.Frame(est)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._dash["ce_title"] = ttk.Label(
+            right, text="모니터링 시작 후 분석됩니다.",
+            font=("", 11, "bold"), foreground="#555555")
+        self._dash["ce_title"].pack(anchor=tk.W)
+
+        self._dash["ce_cause"] = ttk.Label(
+            right, text="", font=("", 9), justify=tk.LEFT, foreground="#333333")
+        self._dash["ce_cause"].pack(anchor=tk.W, padx=4, pady=(4, 2))
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        act_hdr = ttk.Label(right, text="권장 조치:", font=("", 9, "bold"),
+                            foreground="#444444")
+        act_hdr.pack(anchor=tk.W)
+        self._dash["ce_action"] = ttk.Label(
+            right, text="", font=("", 9), justify=tk.LEFT, foreground="#555555")
+        self._dash["ce_action"].pack(anchor=tk.W, padx=4, pady=(2, 0))
+
+        # ── 장애 이력 테이블 ──────────────────────────────────────────
+        ttk.Label(parent,
+            text="  Ping 실패 / NCAgent 종료 / 네트워크 오류 / Windows 이벤트 오류 자동 기록",
+            foreground="#555555").pack(anchor=tk.W, pady=(4, 2))
+        self._fault_tree = self._make_tree(parent,
+            ("dt","ftype","cause","detail"),
+            ("발생시간","유형","원인","상세내용"),
+            (155, 110, 200, 380))
+        self._add_save_bar(parent, self._fault_tree, "장애 분석", "fault_log")
+
+    # ── 공통 트리/저장 ────────────────────────────────────────────────
+    @staticmethod
+    def _make_tree(parent, cols, headings, widths):
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        tree = ttk.Treeview(f, columns=cols, show="headings")
+        for c, h, w in zip(cols, headings, widths):
+            tree.heading(c, text=h)
+            tree.column(c, width=w, anchor=tk.W)
+        tree.tag_configure("OK",   foreground="#006600")
+        tree.tag_configure("FAIL", foreground="#cc0000", font=("", 9, "bold"))
+        tree.tag_configure("WARN", foreground="#cc6600")
+        sb = ttk.Scrollbar(f, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        return tree
+
+    def _add_save_bar(self, parent, tree, label, prefix):
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, padx=6, pady=(0, 2))
+        ttk.Label(bar, text=f"화면에 표시된 {label}을(를) CSV로 저장합니다.",
+                  foreground="#555555").pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="📥  CSV로 저장",
+                   command=lambda t=tree, l=label, p=prefix: self._save_csv(t, l, p),
+                   width=16).pack(side=tk.RIGHT, padx=4)
+
+    def _save_csv(self, tree, label, prefix):
+        rows = [tree.item(iid)["values"] for iid in reversed(tree.get_children())]
+        if not rows:
+            messagebox.showinfo("알림", f"저장할 {label} 데이터가 없습니다.")
+            return
+        name = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = filedialog.asksaveasfilename(title=f"{label} 저장",
+            initialfile=name, defaultextension=".csv",
+            filetypes=[("CSV 파일", "*.csv"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows(rows)
+            messagebox.showinfo("저장 완료", f"총 {len(rows)}건 저장되었습니다.\n\n{path}")
+        except Exception as e:
+            messagebox.showerror("저장 실패", str(e))
+
+    # ── 대상 관리 ─────────────────────────────────────────────────────
+    def _reload_target_tree(self):
+        self._target_tree.delete(*self._target_tree.get_children())
+        for name, ip in self._targets:
+            self._target_tree.insert("", tk.END, values=(name, ip))
+
+    def _add_target(self):
+        dlg = TargetDialog(self.root)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._targets.append(dlg.result)
+            self._reload_target_tree()
+
+    def _del_target(self):
+        sel = self._target_tree.selection()
+        if not sel:
+            return
+        idx = self._target_tree.index(sel[0])
+        if messagebox.askyesno("삭제 확인", f"'{self._targets[idx][0]}' 삭제하시겠습니까?"):
+            self._targets.pop(idx)
+            self._reload_target_tree()
+
+    def _edit_target(self):
+        sel = self._target_tree.selection()
+        if not sel:
+            return
+        idx = self._target_tree.index(sel[0])
+        name, ip = self._targets[idx]
+        dlg = TargetDialog(self.root, name=name, ip=ip, title="대상 수정")
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._targets[idx] = dlg.result
+            self._reload_target_tree()
+
+    def _browse_log_dir(self):
+        cur = self._log_dir.get()
+        init = cur if os.path.exists(cur) else os.path.expanduser("~")
+        d = filedialog.askdirectory(title="로그 저장 폴더 선택", initialdir=init)
+        if d:
+            self._log_dir.set(d)
+
+    # ── 시계 ──────────────────────────────────────────────────────────
+    def _update_clock(self):
+        try:
+            self._dash["time"].config(text=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            self.root.after(1000, self._update_clock)
+        except tk.TclError:
+            pass
+
+    # ── Ping ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _ping(host):
+        try:
+            r = subprocess.run(
+                ["ping", "-n", "1", "-w", "2000", host],
+                capture_output=True, text=True, timeout=6,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            if r.returncode == 0:
+                m = re.search(r"(?:time|시간)[=<](\d+)ms", r.stdout)
+                return True, int(m.group(1)) if m else 0
+            return False, None
+        except Exception:
+            return False, None
+
+    # ── 프로세스 감시 ─────────────────────────────────────────────────
+    def _check_process(self):
+        if not PSUTIL_OK:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        found = None
+        try:
+            for p in psutil.process_iter(["name", "pid", "cpu_percent", "memory_info"]):
+                if p.info.get("name", "").lower() == NCAGENT_EXE.lower():
+                    found = p
+                    break
+        except Exception:
+            pass
+
+        if found:
+            try:
+                pid = found.pid
+                cpu = round(found.cpu_percent(interval=0.2), 1)
+                mem = round(found.memory_info().rss / 1024 / 1024, 1)
+                evt = "시작 감지" if self._ncagent_pid != pid and self._ncagent_pid is not None else (
+                      "재시작" if self._ncagent_pid is not None and self._ncagent_pid != pid else "실행중")
+                self._ncagent_pid    = pid
+                self._ncagent_was_up = True
+                row = [now, pid, cpu, mem, evt]
+                self._wcsv(self._proc_path, row)
+                tag = "WARN" if "감지" in evt else "OK"
+                self.root.after(0, lambda r=row, t=tag, c=cpu, m=mem, p=pid, e=evt: (
+                    self._append_ui(self._proc_tree, r, t),
+                    self._dash["agent_status"].config(text="실행중", foreground="#006600"),
+                    self._dash["agent_detail"].config(text=f"PID:{p}  CPU:{c}%  Mem:{m}MB"),
+                ))
+            except Exception:
+                pass
+        else:
+            if self._ncagent_was_up:
+                row = [now, "-", "-", "-", "종료 감지"]
+                self._wcsv(self._proc_path, row)
+                self._record_fault(now, "프로세스", f"{NCAGENT_EXE} 종료",
+                                   "프로세스가 비정상 종료되었습니다.")
+                with self._lock:
+                    self._stats.agent_stop += 1
+                self._ncagent_pid = None
+                self.root.after(0, lambda r=row: (
+                    self._append_ui(self._proc_tree, r, "FAIL"),
+                    self._dash["agent_status"].config(text="종료됨", foreground="#cc0000"),
+                    self._dash["agent_detail"].config(text="-"),
+                ))
+            elif self._ncagent_was_up is None:
+                self.root.after(0, lambda: (
+                    self._dash["agent_status"].config(text="미실행", foreground="#999999"),
+                    self._dash["agent_detail"].config(text="-"),
+                ))
+            self._ncagent_was_up = False
+
+    # ── 네트워크 어댑터 감시 ──────────────────────────────────────────
+    def _check_network(self):
+        if not PSUTIL_OK:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            stats = psutil.net_if_stats()
+            addrs = psutil.net_if_addrs()
+        except Exception:
+            return
+
+        gw = self._get_gateway()
+        primary_name = primary_ip = ""
+
+        for iface, stat in stats.items():
+            if iface.lower() in ("lo", "loopback"):
+                continue
+            is_up = stat.isup
+            prev  = self._prev_if_up.get(iface)
+
+            if prev is not None and prev != is_up:
+                event = "Link Up" if is_up else "Link Down"
+                ips = ",".join(a.address for a in addrs.get(iface, []) if a.family == 2)
+                row = [now, iface, event, ips, gw or ""]
+                self._wcsv(self._net_path, row)
+                tag = "OK" if is_up else "FAIL"
+                self.root.after(0, lambda r=row, t=tag: self._append_ui(self._net_tree, r, t))
+                if not is_up:
+                    self._record_fault(now, "네트워크", f"어댑터 Link Down", f"{iface}")
+                    with self._lock:
+                        self._stats.net_error += 1
+
+            self._prev_if_up[iface] = is_up
+
+            cur_ips = {a.address for a in addrs.get(iface, []) if a.family == 2}
+            prev_ips = self._prev_if_ips.get(iface)
+            if prev_ips is not None and prev_ips != cur_ips:
+                row = [now, iface, "IP 변경",
+                       f"{','.join(prev_ips)} -> {','.join(cur_ips)}", gw or ""]
+                self._wcsv(self._net_path, row)
+                self.root.after(0, lambda r=row: self._append_ui(self._net_tree, r, "WARN"))
+            self._prev_if_ips[iface] = cur_ips
+
+            if is_up and cur_ips and not primary_name:
+                primary_name = iface
+                primary_ip   = ",".join(cur_ips)
+
+        if self._prev_gw is not None and gw and self._prev_gw != gw:
+            row = [now, "System", "Gateway 변경",
+                   f"{self._prev_gw} -> {gw}", gw]
+            self._wcsv(self._net_path, row)
+            self.root.after(0, lambda r=row: self._append_ui(self._net_tree, r, "WARN"))
+        self._prev_gw = gw
+
+        self.root.after(0, lambda n=primary_name, ip=primary_ip, g=gw: (
+            self._dash["if_name"].config(text=n or "-"),
+            self._dash["if_ip"].config(text=ip or "-"),
+            self._dash["if_gw"].config(text=g or "-"),
+            self._dash["if_status"].config(
+                text="Link Up" if n else "Link Down",
+                foreground="#006600" if n else "#cc0000"),
+        ))
+
+    @staticmethod
+    def _get_gateway():
+        try:
+            r = subprocess.run(["ipconfig"], capture_output=True,
+                               timeout=4, creationflags=subprocess.CREATE_NO_WINDOW)
+            for enc in ("cp949", "utf-8", "euc-kr"):
+                try:
+                    text = r.stdout.decode(enc)
+                    m = re.search(r"(?:기본 게이트웨이|Default Gateway)[^:\d]*([\d.]+)", text)
+                    if m:
+                        return m.group(1)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    # ── Windows 이벤트 로그 수집 ──────────────────────────────────────
+    def _collect_events(self):
+        minutes = max(2, self._interval.get() + 1)
+        providers = ",".join(f"'{p}'" for p in EVT_PROVIDERS)
+        ps = (
+            f"$t=(Get-Date).AddMinutes(-{minutes});"
+            f"$pv=@({providers});"
+            "$ev=Get-WinEvent -FilterHashtable @{LogName='System';StartTime=$t} "
+            "-ErrorAction SilentlyContinue | Where-Object {$pv -contains $_.ProviderName};"
+            "if($ev){$ev | Select-Object -First 40 | ForEach-Object {"
+            "$dt=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss');"
+            "$src=$_.ProviderName;"
+            "$id=$_.Id;"
+            "$lv=$_.LevelDisplayName;"
+            "$mg=(($_.Message -split \"`n\")[0] -replace '`r','').Substring("
+            "0,[Math]::Min(200,(($_.Message -split \"`n\")[0]).Length));"
+            "\"$dt`t$src`t$id`t$lv`t$mg\"}}"
+        )
+        try:
+            r = subprocess.run(
+                ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps],
+                capture_output=True, timeout=20,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            text = ""
+            for enc in ("utf-8", "cp949", "utf-16"):
+                try:
+                    text = r.stdout.decode(enc)
+                    break
+                except Exception:
+                    continue
+            for line in text.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t", 4)
+                if len(parts) < 4:
+                    continue
+                dt, src, eid, lvl = parts[:4]
+                msg = parts[4] if len(parts) > 4 else ""
+                row = [dt, src, eid, lvl, msg]
+                self._wcsv(self._evt_path, row)
+                tag = "FAIL" if lvl in ("오류", "Error") else (
+                      "WARN" if lvl in ("경고", "Warning") else None)
+                self.root.after(0, lambda r=row, t=tag: self._append_ui(self._evt_tree, r, t))
+                if lvl in ("오류", "Error"):
+                    self._record_fault(dt, "Windows 이벤트",
+                                       f"[{src}] ID:{eid}", msg[:120])
+                    with self._lock:
+                        self._stats.net_error += 1
+        except Exception:
+            pass
+
+    # ── NC Agent 로그 파일 감시 ───────────────────────────────────────
+    def _check_ncagent_logs(self):
+        if self._ncagent_dir is None:
+            found = _find_ncagent_dir() or ""
+            self._ncagent_dir = found
+            self.root.after(0, lambda d=found: self._ncagent_path_lbl.config(
+                text=d if d else "NCAgent 경로를 찾을 수 없습니다.",
+                foreground="#333333" if d else "#cc0000"))
+
+        if not self._ncagent_dir or not os.path.isdir(self._ncagent_dir):
+            return
+
+        backup = os.path.join(self._ld, "ncagent_backup")
+        os.makedirs(backup, exist_ok=True)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for logf in glob.glob(os.path.join(self._ncagent_dir, "*.log")):
+            fname = os.path.basename(logf)
+            try:
+                mtime = os.path.getmtime(logf)
+            except Exception:
+                continue
+            prev = self._ncagent_log_mtimes.get(fname, 0)
+            if mtime == prev:
+                continue
+            action = "발견" if prev == 0 else "업데이트"
+            try:
+                dst = os.path.join(backup,
+                                   f"{date.today().strftime('%Y%m%d')}_{fname}")
+                shutil.copy2(logf, dst)
+                action += " → 백업 완료"
+            except Exception as e:
+                action += f" → 백업 실패: {e}"
+            self._ncagent_log_mtimes[fname] = mtime
+            row = [now, fname, action]
+            self.root.after(0, lambda r=row: self._append_ui(self._nclog_tree, r))
+
+    # ── 장애 기록 ─────────────────────────────────────────────────────
+    def _record_fault(self, now, ftype, cause, detail):
+        row = [now, ftype, cause, detail]
+        self._wcsv(self._fault_path, row)
+        self.root.after(0, lambda r=row: self._append_ui(self._fault_tree, r, "FAIL"))
+
+    # ── 일별 보고서 ───────────────────────────────────────────────────
+    def _generate_daily_report(self, snap=None):
+        """CSV 일별 요약 저장."""
+        try:
+            if snap is None:
+                with self._lock:
+                    snap = self._stats.snapshot()
+            self._wcsv(self._report_path, snap.to_row())
+        except Exception:
+            pass
+
+    def _generate_excel_report(self, snap=None):
+        """Excel(.xlsx) 일별 분석 보고서 생성."""
+        try:
+            import openpyxl
+            from openpyxl.styles import (Alignment, Border, Font,
+                                         PatternFill, Side)
+        except ImportError:
+            return  # openpyxl 미설치 시 스킵
+
+        try:
+            if snap is None:
+                with self._lock:
+                    snap = self._stats.snapshot()
+
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "일별 보고서"
+
+            # ── 스타일 정의 ────────────────────────────────────────
+            def fill(hex_color):
+                return PatternFill(fgColor=hex_color, fill_type="solid")
+
+            def border():
+                s = Side(style="thin", color="CCCCCC")
+                return Border(left=s, right=s, top=s, bottom=s)
+
+            C_TITLE  = fill("2E86AB")   # 진파랑
+            C_HEAD   = fill("D6EAF8")   # 연파랑
+            C_OK     = fill("D5F5E3")   # 연초록
+            C_WARN   = fill("FEF9E7")   # 연노랑
+            C_CRIT   = fill("FADBD8")   # 연빨강
+            C_STRIPE = fill("F8F9FA")   # 연회색
+
+            F_TITLE = Font(name="맑은 고딕", size=14, bold=True, color="FFFFFF")
+            F_HEAD  = Font(name="맑은 고딕", size=10, bold=True, color="1A5276")
+            F_BODY  = Font(name="맑은 고딕", size=10)
+            F_CRIT  = Font(name="맑은 고딕", size=10, bold=True, color="C0392B")
+
+            CTR = Alignment(horizontal="center", vertical="center")
+            LFT = Alignment(horizontal="left",   vertical="center")
+
+            # ── 제목 ───────────────────────────────────────────────
+            ws.merge_cells("A1:D1")
+            ws["A1"] = "핑감지 테스트기 — 일별 분석 보고서"
+            ws["A1"].font      = F_TITLE
+            ws["A1"].fill      = C_TITLE
+            ws["A1"].alignment = CTR
+            ws.row_dimensions[1].height = 32
+
+            # ── 메타 정보 ──────────────────────────────────────────
+            ws["A3"] = "보고 일자"
+            ws["B3"] = str(snap.date)
+            ws["A4"] = "생성 시간"
+            ws["B4"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for r in (3, 4):
+                ws.cell(r, 1).font = Font(name="맑은 고딕", size=9, bold=True,
+                                          color="555555")
+                ws.cell(r, 2).font = Font(name="맑은 고딕", size=9, color="333333")
+
+            # ── 헤더 행 ────────────────────────────────────────────
+            ws.row_dimensions[6].height = 22
+            for col, txt in enumerate(["항목", "수치", "단위", "평가"], start=1):
+                c = ws.cell(6, col, value=txt)
+                c.font = F_HEAD; c.fill = C_HEAD
+                c.alignment = CTR; c.border = border()
+
+            # ── 데이터 정의 ────────────────────────────────────────
+            def _eval(val, warn_thr, crit_thr, lower_is_bad=True):
+                """값 평가: 낮을수록 좋은 지표는 lower_is_bad=False."""
+                if lower_is_bad:
+                    if val == 0:   return "정상", C_OK
+                    if val <= warn_thr: return "주의", C_WARN
+                    return "경고", C_CRIT
+                else:
+                    if val <= warn_thr: return "정상", C_OK
+                    if val <= crit_thr: return "주의", C_WARN
+                    return "경고", C_CRIT
+
+            rows_data = [
+                ("총 Ping 수",       snap.total_ping,  "회",  None),
+                ("FAIL 횟수",        snap.total_fail,  "회",  _eval(snap.total_fail,  5, 20)),
+                ("  └ 설비 Ping 실패", snap.equip_fail, "회",  _eval(snap.equip_fail,  3, 10)),
+                ("  └ 서버 Ping 실패", snap.server_fail,"회",  _eval(snap.server_fail, 3, 10)),
+                ("최대 응답시간",    snap.max_rt,      "ms",  _eval(snap.max_rt,    200, 500,
+                                                                     lower_is_bad=False)),
+                ("평균 응답시간",    snap.avg_rt,      "ms",  _eval(snap.avg_rt,     50, 200,
+                                                                     lower_is_bad=False)),
+                ("NC Agent 종료",    snap.agent_stop,  "회",  _eval(snap.agent_stop,  1,  5)),
+                ("동시 장애",        snap.simul_fail,  "회",  _eval(snap.simul_fail,  1,  3)),
+            ]
+
+            for row_idx, (label, value, unit, ev) in enumerate(rows_data, start=7):
+                ws.row_dimensions[row_idx].height = 20
+                is_sub = label.startswith("  └")
+
+                c_lbl = ws.cell(row_idx, 1, value=label)
+                c_val = ws.cell(row_idx, 2, value=value)
+                c_unt = ws.cell(row_idx, 3, value=unit)
+
+                bg = (ev[1] if ev else
+                      C_STRIPE if row_idx % 2 == 0 else
+                      PatternFill(fill_type=None))
+
+                for c in (c_lbl, c_val, c_unt):
+                    c.font      = F_BODY if not (ev and ev[0] == "경고") else F_CRIT
+                    c.fill      = bg
+                    c.border    = border()
+                    c.alignment = LFT if c is c_lbl else CTR
+
+                if is_sub:
+                    c_lbl.font = Font(name="맑은 고딕", size=9, color="666666")
+
+                if ev:
+                    c_ev = ws.cell(row_idx, 4, value=ev[0])
+                    c_ev.font      = (F_CRIT if ev[0] == "경고" else F_BODY)
+                    c_ev.fill      = ev[1]
+                    c_ev.alignment = CTR
+                    c_ev.border    = border()
+
+            # ── 열 너비 ────────────────────────────────────────────
+            ws.column_dimensions["A"].width = 22
+            ws.column_dimensions["B"].width = 12
+            ws.column_dimensions["C"].width = 8
+            ws.column_dimensions["D"].width = 10
+
+            # ── 저장 ───────────────────────────────────────────────
+            fname   = f"daily_report_{snap.date.strftime('%Y%m%d')}.xlsx"
+            outpath = os.path.join(self._ld, fname)
+            wb.save(outpath)
+
+            self.root.after(0, lambda p=outpath: self._safe_status(
+                f"Excel 보고서 생성 완료: {p}"))
+        except Exception:
+            pass
+
+    def _check_day_rollover(self):
+        """자정 넘으면 어제 데이터로 보고서 생성 후 통계 초기화."""
+        with self._lock:
+            if self._stats.date == date.today():
+                return
+            snap = self._stats.snapshot()
+            self._stats.reset()
+
+        # 락 밖에서 파일 IO 수행
+        self._generate_daily_report(snap)
+        self._generate_excel_report(snap)
+        self.root.after(0, self._refresh_stat_labels)
+
+    # ── 대시보드 통계 갱신 ────────────────────────────────────────────
+    def _refresh_stat_labels(self):
+        try:
+            with self._lock:
+                s = self._stats
+            for key, val, warn in [
+                ("s_ping",   s.total_ping,  False),
+                ("s_equip",  s.equip_fail,  s.equip_fail  > 0),
+                ("s_server", s.server_fail, s.server_fail > 0),
+                ("s_agent",  s.agent_stop,  s.agent_stop  > 0),
+                ("s_net",    s.net_error,   s.net_error   > 0),
+            ]:
+                self._dash[key].config(text=str(val),
+                    foreground="#cc0000" if warn else "#006600")
+        except tk.TclError:
+            pass
+        self._update_cause_panel()
+
+    def _update_cause_panel(self):
+        """장애 원인 추정 패널을 현재 상태로 갱신."""
+        try:
+            targets     = list(self._targets)
+            eq_host     = targets[0][1] if targets               else None
+            sv_host     = targets[1][1] if len(targets) > 1      else None
+            eq_name     = targets[0][0] if targets               else "설비"
+            sv_name     = targets[1][0] if len(targets) > 1      else "서버"
+
+            eq_ok  = self._prev_ok.get(eq_host,  True) if eq_host  else True
+            sv_ok  = self._prev_ok.get(sv_host,  True) if sv_host  else True
+            ag_up  = self._ncagent_was_up is True
+            lk_up  = any(self._prev_if_up.values()) if self._prev_if_up else True
+
+            # ── 상태 표시 ──────────────────────────────────────────
+            def _si(key, ok, t_ok, t_fail):
+                self._dash[key].config(
+                    text=t_ok if ok else t_fail,
+                    foreground="#006600" if ok else "#cc0000")
+
+            _si("ce_equip",   eq_ok, f"정상  ({eq_host or '—'})",
+                              f"실패  ({eq_host or '—'})")
+            _si("ce_server",  sv_ok, f"정상  ({sv_host or '—'})",
+                              f"실패  ({sv_host or '—'})")
+            _si("ce_agent",   ag_up,
+                "실행중" if PSUTIL_OK else "미확인",
+                "종료됨" if PSUTIL_OK else "미확인")
+            _si("ce_network", lk_up, "Link Up", "Link Down")
+
+            # ── 원인 키 결정 ───────────────────────────────────────
+            if not lk_up:
+                key = "link_down"
+            elif not eq_ok and not sv_ok:
+                key = "all_fail"
+            elif not eq_ok:
+                key = "equip_fail"
+            elif not sv_ok:
+                key = "server_fail"
+            elif not ag_up and PSUTIL_OK:
+                key = "agent_only"
+            else:
+                key = "normal"
+
+            title, cause, action, color = CAUSE_MATRIX[key]
+
+            self._dash["ce_title"].config(
+                text=f"[ {title} ]", foreground=color)
+            self._dash["ce_cause"].config(text=cause)
+            self._dash["ce_action"].config(text=action)
+
+        except (tk.TclError, KeyError):
+            pass
+
+    # ── 모니터링 루프들 ───────────────────────────────────────────────
+    def _ping_loop(self):
+        while self._running:
+            now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            snapshot = list(self._targets)
+
+            # ── 이번 사이클 Ping 결과 수집 ────────────────────────────
+            results = []
+            for i, (name, host) in enumerate(snapshot):
+                if not self._running:
+                    break
+                ok, rt = self._ping(host)
+                results.append((i, name, host, ok, rt))
+
+            # ── 통계 일괄 업데이트 (lock 한 번) ───────────────────────
+            with self._lock:
+                cycle_fail = sum(1 for _, _, _, ok, _ in results if not ok)
+                if cycle_fail == len(results) and len(results) > 0:
+                    self._stats.simul_fail += 1   # 전체 동시 FAIL
+
+                for i, name, host, ok, rt in results:
+                    self._stats.total_ping += 1
+                    if not ok:
+                        if i == 0: self._stats.equip_fail += 1
+                        else:      self._stats.server_fail += 1
+                    elif rt is not None and rt > 0:
+                        if rt > self._stats.max_rt:
+                            self._stats.max_rt = rt
+                        self._stats.sum_rt   += rt
+                        self._stats.rt_count += 1
+
+            # ── UI 업데이트 + 장애 기록 + 지속시간 계산 ─────────────────
+            now_dt   = datetime.now()
+            any_fail = any(not ok for _, _, _, ok, _ in results)
+
+            for i, name, host, ok, rt in results:
+                status  = "OK" if ok else "FAIL"
+                rt_val  = rt if rt is not None else ""
+                rt_disp = f"{rt} ms" if rt is not None else "시간초과"
+
+                self._wcsv(self._ping_path, [now, host, status, rt_val])
+
+                prev_ok = self._prev_ok.get(host, True)
+
+                if not ok:
+                    cause = "설비 Ping FAIL" if i == 0 else "서버 Ping FAIL"
+                    self._record_fault(now, "Ping 실패", cause, f"{host} 응답 없음")
+
+                    if prev_ok:                          # OK → FAIL (장애 시작)
+                        self._fail_start[host] = now_dt
+                        # 스크린샷 (별도 스레드)
+                        threading.Thread(target=self._take_screenshot,
+                                         daemon=True).start()
+                        self.root.after(0, lambda: self._set_led("led_status", "#ff3333"))
+
+                elif not prev_ok:                        # FAIL → OK (복구)
+                    start_dt = self._fail_start.pop(host, None)
+                    if start_dt:
+                        sec = int((now_dt - start_dt).total_seconds())
+                        dur = (f"{sec//60}분 {sec%60}초" if sec >= 60
+                               else f"{sec}초")
+                        rec_row = [now, "Ping 복구", f"{name} 복구",
+                                   f"{host}  |  지속시간: {dur}"]
+                        self._wcsv(self._fault_path, rec_row)
+                        self.root.after(0, lambda r=rec_row:
+                            self._append_ui(self._fault_tree, r, "OK"))
+                    # 모든 대상 복구 시 Status → yellow
+                    if not any_fail:
+                        self.root.after(0, lambda:
+                            self._set_led("led_status", "#ffcc00"))
+
+                self._prev_ok[host] = ok
+
+                dk = "equip_status" if i == 0 else "server_status"
+                dr = "equip_detail" if i == 0 else "server_detail"
+
+                def _upd(s=status, rd=rt_disp, k=dk, kr=dr, n=now, h=host, rv=rt_val):
+                    try:
+                        self._append_ui(self._ping_tree, [n, h, s, str(rv)], s)
+                        self._dash[k].config(text=s,
+                            foreground="#006600" if s == "OK" else "#cc0000")
+                        self._dash[kr].config(text=rd)
+                    except Exception:
+                        pass
+
+                self.root.after(0, _upd)
+
+            self.root.after(0, self._refresh_stat_labels)
+            self._check_day_rollover()
+
+            if self._running:
+                self.root.after(0, lambda n=now: self._safe_status(
+                    f"모니터링 중...   마지막 체크: {n}"))
+                time.sleep(self._interval.get())
+
+    def _process_loop(self):
+        time.sleep(2)
+        while self._running:
+            self._check_process()
+            for _ in range(5):
+                if not self._running:
+                    return
+                time.sleep(1)
+
+    def _network_loop(self):
+        time.sleep(3)
+        while self._running:
+            self._check_network()
+            for _ in range(5):
+                if not self._running:
+                    return
+                time.sleep(1)
+
+    def _event_loop(self):
+        time.sleep(15)
+        while self._running:
+            self._collect_events()
+            for _ in range(60):
+                if not self._running:
+                    return
+                time.sleep(1)
+
+    def _ncagent_log_loop(self):
+        time.sleep(5)
+        while self._running:
+            self._check_ncagent_logs()
+            for _ in range(30):
+                if not self._running:
+                    return
+                time.sleep(1)
+
+    # ── 스크린샷 (.NET / PowerShell) ─────────────────────────────────
+    def _take_screenshot(self):
+        """장애 발생 시 PowerShell(.NET)로 전체 화면 캡처."""
+        try:
+            sdir = os.path.join(self._ld, "screenshots")
+            os.makedirs(sdir, exist_ok=True)
+            fname = f"Screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            fpath = os.path.join(sdir, fname).replace("'", "''")
+
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+                "$s=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                "$b=New-Object System.Drawing.Bitmap($s.Width,$s.Height); "
+                "$g=[System.Drawing.Graphics]::FromImage($b); "
+                "$g.CopyFromScreen($s.Location,"
+                "[System.Drawing.Point]::Empty,$s.Size); "
+                f"$b.Save('{fpath}'); "
+                "$g.Dispose();$b.Dispose()"
+            )
+            subprocess.run(
+                ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps],
+                capture_output=True, timeout=12,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception:
+            pass
+
+    # ── LED 인디케이터 ────────────────────────────────────────────────
+    def _set_led(self, key, color):
+        """대시보드 LED 색상 변경."""
+        try:
+            self._dash[key].itemconfig("led", fill=color)
+        except (tk.TclError, KeyError):
+            pass
+
+    def _safe_status(self, text):
+        try:
+            self._status_bar.config(text=text)
+        except tk.TclError:
+            pass
+
+    # ── 시작 / 중지 / 종료 ────────────────────────────────────────────
+    def _start(self):
+        if not self._targets:
+            messagebox.showwarning("알림", "대상 IP를 먼저 추가하세요.")
+            return
+        if not self._log_dir.get().strip():
+            messagebox.showwarning("알림", "로그 경로를 입력하세요.")
+            return
+        try:
+            self._ensure_logs()
+        except Exception as e:
+            messagebox.showerror("오류", f"로그 폴더 생성 실패:\n{e}")
+            return
+
+        self._running = True
+        self._threads.clear()
+        self._start_btn.config(state=tk.DISABLED)
+        self._stop_btn.config(state=tk.NORMAL)
+        self._add_btn.config(state=tk.DISABLED)
+        self._del_btn.config(state=tk.DISABLED)
+        self._edt_btn.config(state=tk.DISABLED)
+        self._log_entry.config(state=tk.DISABLED)
+        self._browse_btn.config(state=tk.DISABLED)
+
+        for fn in [self._ping_loop, self._process_loop, self._network_loop,
+                   self._event_loop, self._ncagent_log_loop]:
+            t = threading.Thread(target=fn, daemon=True)
+            self._threads.append(t)
+            t.start()
+
+        self._set_led("led_power",  "#00dd44")  # 녹색
+        self._set_led("led_status", "#ffcc00")  # 노란색
+        self._status_bar.config(text=f"모니터링 시작  —  로그: {self._ld}")
+
+    def _stop(self):
+        self._running = False
+        self._generate_daily_report()
+        self._generate_excel_report()
+        self._set_led("led_power",  "#888888")  # 회색
+        self._set_led("led_status", "#888888")
+        self._reset_buttons()
+        self._status_bar.config(text="모니터링 중지됨")
+
+    def _reset_buttons(self):
+        self._start_btn.config(state=tk.NORMAL)
+        self._stop_btn.config(state=tk.DISABLED)
+        self._add_btn.config(state=tk.NORMAL)
+        self._del_btn.config(state=tk.NORMAL)
+        self._edt_btn.config(state=tk.NORMAL)
+        self._log_entry.config(state=tk.NORMAL)
+        self._browse_btn.config(state=tk.NORMAL)
+
+    def _on_close(self):
+        self._running = False
+        self._generate_daily_report()
+        self._generate_excel_report()
+        self._save_config()
+        self.root.quit()
+        self.root.destroy()
+
+
+# ── 아이콘 생성 ───────────────────────────────────────────────────────
+_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+
+
+def _make_icon_png():
+    """64×64 귀여운 핑 아이콘 PNG 바이트 생성 (순수 Python)."""
+    W = H = 64
+    cx = cy = 32.0
+
+    rows = []
+    for y in range(H):
+        row = bytearray([0])          # PNG filter: None
+        for x in range(W):
+            dx, dy = x - cx, y - cy
+            dist   = math.sqrt(dx * dx + dy * dy)
+            R      = 29.0
+
+            if dist > R + 1.5:
+                row += b'\x00\x00\x00\x00'
+                continue
+
+            # ── 배경 : 하늘색 → 파란색 그라디언트 ──────────────────
+            t  = min(dist / R, 1.0)
+            rc = int(100 - t * 25)
+            gc = int(180 - t * 40)
+            bc = int(240 - t * 40)
+
+            # 테두리 부드럽게
+            alpha = min(255, max(0, int(255 * (R + 1.5 - dist) / 1.5)))
+
+            # ── 흰색 핑 아크 (상단 반원) ───────────────────────────
+            angle    = math.degrees(math.atan2(-dy, dx))  # 90°=위, 0°=오른쪽
+            on_white = dist < 4.5   # 중심 점
+
+            if not on_white:
+                for arc_r, arc_w in [(9.5, 2.2), (17.0, 2.2), (24.5, 2.2)]:
+                    if abs(dist - arc_r) < arc_w and 25 <= angle <= 155:
+                        on_white = True
+                        break
+
+            if on_white:
+                row += bytes([255, 255, 255, alpha])
+            else:
+                row += bytes([rc, gc, bc, alpha])
+        rows.append(bytes(row))
+
+    raw  = b''.join(rows)
+    comp = zlib.compress(raw, 6)
+
+    def chunk(name, data):
+        body = name + data
+        return (struct.pack('>I', len(data)) + body
+                + struct.pack('>I', zlib.crc32(body) & 0xFFFFFFFF))
+
+    return (b'\x89PNG\r\n\x1a\n'
+            + chunk(b'IHDR', struct.pack('>II', W, H) + bytes([8, 6, 0, 0, 0]))
+            + chunk(b'IDAT', comp)
+            + chunk(b'IEND', b''))
+
+
+def _make_icon_ico(png_data):
+    """PNG 데이터를 단일 ICO 파일로 래핑 (Windows PNG-in-ICO 지원)."""
+    header = struct.pack('<HHH', 0, 1, 1)            # 예약, type=1(ICO), 이미지수=1
+    entry  = struct.pack('<BBBBHHII',
+                         64, 64,           # width, height
+                         0,                # 색상 수 (true-color = 0)
+                         0,                # 예약
+                         1,                # planes
+                         32,               # bpp
+                         len(png_data),
+                         6 + 16)           # 데이터 오프셋
+    return header + entry + png_data
+
+
+def _setup_icon(root):
+    """아이콘 생성 → .ico 저장 → 창 아이콘 적용."""
+    try:
+        png = _make_icon_png()
+        ico = _make_icon_ico(png)
+
+        with open(_ICON_PATH, 'wb') as f:
+            f.write(ico)
+        root.iconbitmap(_ICON_PATH)
+    except Exception:
+        # .ico 실패 시 PhotoImage로 대체 시도
+        try:
+            img = tk.PhotoImage(data=base64.b64encode(png).decode())
+            root.iconphoto(True, img)
+            root._app_icon = img          # GC 방지
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    _setup_icon(root)
+    PingMonitorApp(root)
+    root.mainloop()
+    try:
+        root.destroy()
+    except Exception:
+        pass
