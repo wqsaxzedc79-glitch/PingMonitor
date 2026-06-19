@@ -30,7 +30,10 @@ except ImportError:
 
 # ── 상수 ─────────────────────────────────────────────────────────────
 NCAGENT_EXE = "NCAgent.exe"
-CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# exe(PyInstaller) / .py 실행 모두 exe(또는 스크립트)와 같은 폴더 기준
+_BASE_DIR    = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+                else os.path.dirname(os.path.abspath(__file__)))
+CONFIG_FILE  = os.path.join(_BASE_DIR, "config.json")
 
 H_PING   = ["DateTime", "Target", "Status", "ResponseTime_ms"]
 H_PROC   = ["DateTime", "PID", "CPU_pct", "Memory_MB", "Event"]
@@ -112,11 +115,7 @@ CAUSE_MATRIX = {
 
 
 # ── 헬퍼 ─────────────────────────────────────────────────────────────
-# PyInstaller exe 실행 시에는 sys.executable 기준, 일반 .py 실행 시에는 __file__ 기준
-if getattr(sys, 'frozen', False):
-    _SCRIPT_DIR = os.path.dirname(sys.executable)
-else:
-    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = _BASE_DIR   # CONFIG_FILE 정의 시 이미 계산됨
 
 
 def _default_log_dir():
@@ -1799,7 +1798,7 @@ class PingMonitorApp:
 
 
 # ── 아이콘 생성 ───────────────────────────────────────────────────────
-_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+_ICON_PATH = os.path.join(_BASE_DIR, "app_icon.ico")
 
 
 def _make_icon_png():
