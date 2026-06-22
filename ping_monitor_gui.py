@@ -533,6 +533,11 @@ class PingMonitorApp:
         self._watch_day()              # 모니터링 중지 상태에서도 자정 감지
         self._check_previous_crash()   # 이전 비정상 종료 여부 확인
 
+        # 저장된 NC Agent 경로가 있으면 탭에 즉시 표시
+        if self._ncagent_dir and os.path.isdir(self._ncagent_dir):
+            self._ncagent_path_lbl.config(
+                text=self._ncagent_dir, foreground="#333333")
+
     # ── 설정 저장/불러오기 ────────────────────────────────────────────
     def _save_config(self):
         # 저장 시: tuple(name, host) → dict 형식으로 변환
@@ -556,7 +561,8 @@ class PingMonitorApp:
                              {"suspect_fail_count": 3,
                               "fault_fail_count": 5,
                               "recovery_success_count": 3}),
-            "last_date": str(self._stats.date),  # 재시작 후 롤오버 감지용
+            "last_date":    str(self._stats.date),
+            "ncagent_dir":  self._ncagent_dir or "",  # 수동 지정 경로 유지
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -634,6 +640,11 @@ class PingMonitorApp:
                     self._stats.date = last
             except (ValueError, AttributeError):
                 pass
+
+        # 수동 지정된 NC Agent 경로 복원
+        saved_nc = d.get("ncagent_dir", "").strip()
+        if saved_nc and os.path.isdir(saved_nc):
+            self._ncagent_dir = saved_nc
 
     # ── 로그 경로 프로퍼티 ────────────────────────────────────────────
     @property
@@ -863,10 +874,7 @@ class PingMonitorApp:
             self._dash[key] = v
 
         if not PSUTIL_OK:
-            ttk.Label(parent,
-                      text="  psutil 미설치: NC Agent / 네트워크 어댑터 기능 비활성화  "
-                           "(pip install psutil)",
-                      foreground="#cc6600", relief=tk.GROOVE).pack(pady=6, padx=12)
+            self._build_psutil_install_bar(parent)
 
         # ── 실시간 응답시간 그래프 ─────────────────────────────────────
         gp = tk.PanedWindow(parent, orient=tk.VERTICAL,
@@ -899,8 +907,7 @@ class PingMonitorApp:
             (155, 80, 80, 100, 280))
         self._add_save_bar(parent, self._proc_tree, "프로세스 로그", "process_log")
         if not PSUTIL_OK:
-            ttk.Label(parent, text="  psutil 필요:  pip install psutil",
-                      foreground="#cc0000").pack(pady=4)
+            self._build_psutil_install_bar(parent)
 
     def _build_network_tab(self, parent):
         ttk.Label(parent,
@@ -912,8 +919,7 @@ class PingMonitorApp:
             (155, 160, 110, 140, 120))
         self._add_save_bar(parent, self._net_tree, "네트워크 로그", "network_log")
         if not PSUTIL_OK:
-            ttk.Label(parent, text="  psutil 필요:  pip install psutil",
-                      foreground="#cc0000").pack(pady=4)
+            self._build_psutil_install_bar(parent)
 
     def _build_event_tab(self, parent):
         ttk.Label(parent,
@@ -933,7 +939,9 @@ class PingMonitorApp:
         ttk.Label(r, text="경로:").pack(side=tk.LEFT)
         self._ncagent_path_lbl = ttk.Label(r, text="모니터링 시작 후 자동 탐색",
                                             foreground="#888888")
-        self._ncagent_path_lbl.pack(side=tk.LEFT, padx=6)
+        self._ncagent_path_lbl.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        ttk.Button(r, text="직접 선택",
+                   command=self._browse_ncagent_dir, width=10).pack(side=tk.RIGHT)
 
         self._nclog_tree = self._make_tree(parent,
             ("dt","fname","action"),
@@ -2259,6 +2267,67 @@ class PingMonitorApp:
     # ════════════════════════════════════════════════════════════════
     # 24시간 안정성 메서드
     # ════════════════════════════════════════════════════════════════
+
+    # ── NC Agent 경로 직접 선택 ──────────────────────────────────
+    def _browse_ncagent_dir(self) -> None:
+        """NC Agent 설치 경로를 사용자가 직접 선택."""
+        cur = self._ncagent_dir or os.path.expanduser("~")
+        if not os.path.isdir(cur):
+            cur = os.path.expanduser("~")
+        d = filedialog.askdirectory(
+            title="NC Agent 설치 폴더 선택 (Log 폴더 또는 설치 폴더)",
+            initialdir=cur)
+        if not d:
+            return
+        # Log 하위 폴더가 있으면 그쪽 사용
+        log_sub = os.path.join(d, "Log")
+        self._ncagent_dir = log_sub if os.path.isdir(log_sub) else d
+        self._ncagent_log_mtimes.clear()  # 재스캔
+        self._ncagent_path_lbl.config(
+            text=self._ncagent_dir, foreground="#333333")
+        # config에 저장 (재시작해도 유지)
+        self._save_config()
+
+    # ── psutil 설치 버튼 위젯 ─────────────────────────────────────
+    def _build_psutil_install_bar(self, parent) -> None:
+        """psutil 미설치 경고 + 설치 버튼."""
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, padx=12, pady=6)
+        ttk.Label(bar,
+                  text="psutil 미설치: NC Agent / 네트워크 어댑터 기능 비활성화",
+                  foreground="#cc6600").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(bar, text="지금 설치",
+                   command=self._install_psutil, width=12).pack(side=tk.LEFT)
+
+    def _install_psutil(self) -> None:
+        """psutil을 pip으로 자동 설치."""
+        self.root.config(cursor="wait")
+        self.root.update()
+        try:
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "psutil"],
+                capture_output=True, text=True, timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+
+            if result.returncode == 0:
+                messagebox.showinfo(
+                    "psutil 설치 완료",
+                    "psutil 설치가 완료되었습니다.\n\n"
+                    "프로그램을 종료 후 다시 실행하면\n"
+                    "NC Agent 감시 / 네트워크 어댑터 기능이 활성화됩니다.")
+            else:
+                err = (result.stderr or result.stdout or "")[-400:]
+                messagebox.showerror(
+                    "설치 실패",
+                    f"psutil 설치 실패:\n{err}\n\n"
+                    "인터넷 연결을 확인하거나\n"
+                    "명령 프롬프트에서 직접 실행해보세요:\n"
+                    "pip install psutil")
+        except Exception as e:
+            messagebox.showerror("오류", str(e))
+        finally:
+            self.root.config(cursor="")
 
     # ── 절전 복귀 Grace Period ────────────────────────────────────
     def _start_grace_period(self, duration: int = 45) -> None:
