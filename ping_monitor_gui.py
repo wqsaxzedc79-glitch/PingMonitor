@@ -1284,7 +1284,7 @@ class PingMonitorApp:
         self.root.after(0, lambda n=primary_name, ip=primary_ip, g=gw: (
             self._dash["if_name"].config(text=n or "-"),
             self._dash["if_ip"].config(text=ip or "-"),
-            self._dash["if_gw"].config(text=g or "-"),
+            self._dash["if_gw"].config(text=g or "없음"),
             self._dash["if_status"].config(
                 text="Link Up" if n else "Link Down",
                 foreground="#006600" if n else "#cc0000"),
@@ -1292,13 +1292,23 @@ class PingMonitorApp:
 
     @staticmethod
     def _get_gateway():
+        """
+        ipconfig 출력에서 기본 게이트웨이 IP를 추출.
+        '. . . . :' 구분자의 점이 매칭되는 오탐을 막기 위해
+        콜론 이후에 실제 IP 형식(n.n.n.n)만 허용.
+        """
+        _IP_PAT = re.compile(
+            r"(?:기본 게이트웨이|Default Gateway)"  # 레이블
+            r"[^\n]*?:\s*"                           # 콜론까지 (한 줄 내)
+            r"((?:\d{1,3}\.){3}\d{1,3})"            # x.x.x.x 형식만 허용
+        )
         try:
             r = subprocess.run(["ipconfig"], capture_output=True,
                                timeout=4, creationflags=subprocess.CREATE_NO_WINDOW)
             for enc in ("cp949", "utf-8", "euc-kr"):
                 try:
                     text = r.stdout.decode(enc)
-                    m = re.search(r"(?:기본 게이트웨이|Default Gateway)[^:\d]*([\d.]+)", text)
+                    m = _IP_PAT.search(text)
                     if m:
                         return m.group(1)
                 except Exception:
