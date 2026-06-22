@@ -22,6 +22,15 @@ from collections import deque
 from datetime import datetime, date, timedelta
 from tkinter import filedialog, messagebox, ttk
 
+# 핵심 모듈 (core.py, startup.py)
+try:
+    from core import (SystemLogger, CsvLogger, FaultEngine, FaultPolicy,
+                      DailyReporter, validate_config, validate_interval_warn)
+    from startup import TrayManager, is_startup_enabled, set_startup
+    _CORE_OK = True
+except ImportError as _core_err:
+    _CORE_OK = False
+
 try:
     import psutil
     PSUTIL_OK = True
@@ -34,6 +43,7 @@ NCAGENT_EXE = "NCAgent.exe"
 _BASE_DIR    = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
                 else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE  = os.path.join(_BASE_DIR, "config.json")
+_FLAG_FILE   = os.path.join(_BASE_DIR, ".running")   # 비정상 종료 감지용
 
 H_PING   = ["DateTime", "Target", "Status", "ResponseTime_ms"]
 H_PROC   = ["DateTime", "PID", "CPU_pct", "Memory_MB", "Event"]
@@ -478,22 +488,82 @@ class PingMonitorApp:
         self._graph_equip  = None   # RTGraph — 설비 Ping
         self._graph_server = None   # RTGraph — 서버 Ping
 
+        # ── 24시간 안정성 변수 ─────────────────────────────────────
+        self._log_lock       = threading.Lock()  # 모든 CSV 쓰기 통합 잠금
+        self._grace_until    = None              # 절전 복귀 유예 기간 종료 시각
+        self._next_cycle_exp = None              # sleep 감지용 예상 시각
+        self._last_ping_time = time.monotonic()  # watchdog 기준 시각
+        self._last_save_time = time.monotonic()  # 마지막 config 저장 시각
+
+        # core.py 모듈 인스턴스 (로거, 장애 엔진, 보고서)
+        self._fault_policy = FaultPolicy() if _CORE_OK else None
+        log_dir = _default_log_dir()
+        if _CORE_OK:
+            self._sys_log  = SystemLogger(log_dir)
+            self._csv_log  = CsvLogger(log_dir, self._sys_log)
+            self._reporter = DailyReporter(
+                os.path.join(_SCRIPT_DIR, "reports"), self._sys_log)
+        else:
+            self._sys_log = self._csv_log = self._reporter = None
+        self._engines = {}   # host -> FaultEngine (모니터링 시작 시 생성)
+
+        # 트레이 아이콘
+        if _CORE_OK:
+            self._tray = TrayManager(
+                on_show=self._tray_show,
+                on_quit=self._tray_quit)
+        else:
+            self._tray = None
+        self._minimize_to_tray = tk.BooleanVar(value=False)
+
+        # 연속 실패 그룹 추적 (일시적 응답 누락 판단용)
+        self._streak_count  = {}   # host -> 현재 연속 실패 수
+        self._streak_start  = {}   # host -> 실패 시작 datetime
+        self._streak_svr_ok = {}   # host -> 실패 시작 시 서버 Ping 상태
+        self._streak_simul  = {}   # host -> 동시 실패 여부
+        self._analysis_today = {   # 오늘 분석 집계
+            "total": 0, "transient": 0, "fault": 0,
+            "max_streak": 0, "max_dur": 0, "common": False,
+        }
+
         self._build_ui()
         self._load_config()
         self._reload_target_tree()
         self._update_clock()
+        self._watch_day()              # 모니터링 중지 상태에서도 자정 감지
+        self._check_previous_crash()   # 이전 비정상 종료 여부 확인
 
     # ── 설정 저장/불러오기 ────────────────────────────────────────────
     def _save_config(self):
+        # 저장 시: tuple(name, host) → dict 형식으로 변환
+        targets_out = []
+        for t in self._targets:
+            if isinstance(t, (list, tuple)) and len(t) >= 2:
+                name, host = str(t[0]), str(t[1])
+                role = getattr(self, "_target_roles", {}).get(host, "equipment")
+                targets_out.append({"name": name, "host": host, "role": role})
+            elif isinstance(t, dict):
+                targets_out.append(t)
+
+        cfg = {
+            "targets":        targets_out,
+            "log_dir":        self._log_dir.get(),
+            "report_dir":     os.path.join(_SCRIPT_DIR, "reports"),
+            "interval":       self._interval.get(),
+            "retention_days": self._retention_days.get(),
+            "fault_policy": (self._fault_policy.as_dict()
+                             if self._fault_policy else
+                             {"suspect_fail_count": 3,
+                              "fault_fail_count": 5,
+                              "recovery_success_count": 3}),
+            "last_date": str(self._stats.date),  # 재시작 후 롤오버 감지용
+        }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump({"targets": self._targets,
-                           "log_dir": self._log_dir.get(),
-                           "interval": self._interval.get(),
-                           "retention_days": self._retention_days.get()},
-                          f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            if self._sys_log:
+                self._sys_log.log("_save_config", e)
 
     def _load_config(self):
         if not os.path.exists(CONFIG_FILE):
@@ -501,22 +571,69 @@ class PingMonitorApp:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if isinstance(d.get("targets"), list) and d["targets"]:
-                self._targets = [tuple(t) for t in d["targets"]]
-            saved_dir = d.get("log_dir", "").strip()
-            if saved_dir:
-                # 절대경로인 경우 해당 드라이브/루트가 이 PC에 존재할 때만 사용
-                drive = os.path.splitdrive(saved_dir)[0]
-                drive_ok = (not drive) or os.path.exists(drive + os.sep)
-                if drive_ok:
-                    self._log_dir.set(saved_dir)
-                # 드라이브가 없으면 기본값(logs 폴더) 유지
-            if isinstance(d.get("interval"), int) and 1 <= d["interval"] <= 300:
-                self._interval.set(d["interval"])
-            if isinstance(d.get("retention_days"), int) and 1 <= d["retention_days"] <= 365:
-                self._retention_days.set(d["retention_days"])
-        except Exception:
-            pass
+        except Exception as e:
+            if self._sys_log:
+                self._sys_log.log("_load_config", e, "config.json 읽기 실패")
+            return
+
+        # targets: 내부는 항상 tuple(name, host)로 유지 (기존 코드 호환)
+        # role 정보는 FaultEngine 생성 시 config dict에서 별도 참조
+        raw = d.get("targets")
+        if isinstance(raw, list) and raw:
+            parsed = []
+            for t in raw:
+                if isinstance(t, dict):
+                    name = str(t.get("name", "")).strip()
+                    host = str(t.get("host", "")).strip()
+                    if host:
+                        parsed.append((name, host))
+                elif isinstance(t, (list, tuple)) and len(t) >= 2:
+                    name = str(t[0]).strip()
+                    host = str(t[1]).strip()
+                    if host:
+                        parsed.append((name, host))
+            if parsed:
+                self._targets = parsed
+
+        # role 정보는 별도 보관 (FaultEngine용, index 기반 fallback)
+        self._target_roles = {}
+        if isinstance(raw, list):
+            for i, t in enumerate(raw):
+                if isinstance(t, dict):
+                    host = str(t.get("host", "")).strip()
+                    role = t.get("role", "equipment")
+                    self._target_roles[host] = role
+
+        saved_dir = d.get("log_dir", "").strip()
+        if saved_dir:
+            drive    = os.path.splitdrive(saved_dir)[0]
+            drive_ok = (not drive) or os.path.exists(drive + os.sep)
+            if drive_ok:
+                self._log_dir.set(saved_dir)
+
+        iv = d.get("interval")
+        if isinstance(iv, int) and 1 <= iv <= 300:
+            self._interval.set(iv)
+
+        rd = d.get("retention_days")
+        if isinstance(rd, int) and 1 <= rd <= 365:
+            self._retention_days.set(rd)
+
+        # fault_policy
+        if _CORE_OK and d.get("fault_policy"):
+            self._fault_policy = FaultPolicy(d)
+
+        # 마지막 기록 날짜 → 재시작 시 날짜 바뀌었으면 롤오버 처리
+        last_date_str = d.get("last_date", "")
+        if last_date_str:
+            try:
+                last = date.fromisoformat(last_date_str)
+                if last < date.today():
+                    # 재시작 전에 날짜가 바뀜 → stats.date를 마지막 날짜로 설정
+                    # _watch_day()가 1분 이내에 rollover 처리
+                    self._stats.date = last
+            except (ValueError, AttributeError):
+                pass
 
     # ── 로그 경로 프로퍼티 ────────────────────────────────────────────
     @property
@@ -546,10 +663,15 @@ class PingMonitorApp:
                 with open(path, "w", newline="", encoding="utf-8-sig") as f:
                     csv.writer(f).writerow(hdr)
 
-    @staticmethod
-    def _wcsv(path, row):
-        with open(path, "a", newline="", encoding="utf-8-sig") as f:
-            csv.writer(f).writerow(row)
+    def _wcsv(self, path, row):
+        """모든 CSV 쓰기를 _log_lock으로 보호."""
+        with self._log_lock:
+            try:
+                with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                    csv.writer(f).writerow(row)
+            except Exception as e:
+                if self._sys_log:
+                    self._sys_log.log("_wcsv", e, str(path))
 
     def _append_ui(self, tree, values, tag=None):
         try:
@@ -646,7 +768,7 @@ class PingMonitorApp:
                                           font=("", 8))
         self._archive_status.pack(side=tk.LEFT, padx=4)
 
-        # 시작/중지 버튼
+        # 시작/중지 + 자동 실행 버튼
         ctrl = ttk.Frame(frm)
         ctrl.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
         self._start_btn = ttk.Button(ctrl, text="▶  시작", command=self._start, width=14)
@@ -654,6 +776,11 @@ class PingMonitorApp:
                                       state=tk.DISABLED)
         self._start_btn.pack(pady=4)
         self._stop_btn.pack(pady=4)
+        _startup_text = ("자동 실행 해제" if (_CORE_OK and is_startup_enabled())
+                         else "시작 시 자동 실행")
+        self._startup_btn = ttk.Button(ctrl, text=_startup_text,
+                                        command=self._toggle_startup, width=14)
+        self._startup_btn.pack(pady=2)
 
     # ── 대시보드 탭 ───────────────────────────────────────────────────
     def _build_dashboard_tab(self, parent):
@@ -815,14 +942,42 @@ class PingMonitorApp:
         self._add_save_bar(parent, self._nclog_tree, "NC Agent 로그", "ncagent_log")
 
     def _build_fault_tab(self, parent):
-        # ── 원인 추정 패널 ────────────────────────────────────────────
-        est = ttk.LabelFrame(parent, text="원인 추정", padding=10)
+        # ── 오늘 응답 누락 분석 요약 박스 ────────────────────────────
+        sum_frm = ttk.LabelFrame(parent, text="오늘 응답 누락 분석 요약", padding=8)
+        sum_frm.pack(fill=tk.X, padx=8, pady=(6, 4))
+
+        for lbl, key, init in [
+            ("총 실패 그룹",   "as_total",     "0"),
+            ("일시적 누락",    "as_transient", "0"),
+            ("실제 장애 의심", "as_fault",     "0"),
+            ("최대 연속 실패", "as_max_streak","—"),
+            ("최대 지속시간",  "as_max_dur",   "—"),
+            ("공통 장애",      "as_common",    "없음"),
+        ]:
+            col = ttk.Frame(sum_frm)
+            col.pack(side=tk.LEFT, expand=True, padx=4)
+            ttk.Label(col, text=lbl, font=("", 8),
+                      foreground="#666666").pack()
+            v = ttk.Label(col, text=init, font=("", 13, "bold"),
+                          anchor=tk.CENTER)
+            v.pack(fill=tk.X)
+            self._dash[key] = v
+
+        # ── 서브 노트북: 원인 추정 & 장애 이력 / 응답 누락 분석 ──────
+        sub = ttk.Notebook(parent)
+        sub.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        t1 = ttk.Frame(sub)
+        t2 = ttk.Frame(sub)
+        sub.add(t1, text="  원인 추정 & 장애 이력  ")
+        sub.add(t2, text="  응답 누락 분석  ")
+
+        # ── 탭1: 기존 원인 추정 패널 + 장애 이력 ─────────────────────
+        est = ttk.LabelFrame(t1, text="원인 추정", padding=10)
         est.pack(fill=tk.X, padx=8, pady=(6, 4))
 
-        # 상태 행 (좌측)
         left = ttk.Frame(est)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
-
         for key, label in [
             ("ce_equip",   "설비 Ping"),
             ("ce_server",  "서버 Ping"),
@@ -833,44 +988,57 @@ class PingMonitorApp:
             row.pack(fill=tk.X, pady=3)
             ttk.Label(row, text=f"{label}:", width=11,
                       font=("", 9, "bold"), anchor=tk.W).pack(side=tk.LEFT)
-            lbl = ttk.Label(row, text="—", width=12, font=("", 9))
+            lbl = ttk.Label(row, text="—", width=28, font=("", 9))
             lbl.pack(side=tk.LEFT)
             self._dash[key] = lbl
 
-        # 구분선
         ttk.Separator(est, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-
-        # 추정 결과 (우측)
         right = ttk.Frame(est)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
         self._dash["ce_title"] = ttk.Label(
             right, text="모니터링 시작 후 분석됩니다.",
             font=("", 11, "bold"), foreground="#555555")
         self._dash["ce_title"].pack(anchor=tk.W)
-
         self._dash["ce_cause"] = ttk.Label(
             right, text="", font=("", 9), justify=tk.LEFT, foreground="#333333")
         self._dash["ce_cause"].pack(anchor=tk.W, padx=4, pady=(4, 2))
-
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
-
-        act_hdr = ttk.Label(right, text="권장 조치:", font=("", 9, "bold"),
-                            foreground="#444444")
-        act_hdr.pack(anchor=tk.W)
+        ttk.Label(right, text="권장 조치:", font=("", 9, "bold"),
+                  foreground="#444444").pack(anchor=tk.W)
         self._dash["ce_action"] = ttk.Label(
             right, text="", font=("", 9), justify=tk.LEFT, foreground="#555555")
         self._dash["ce_action"].pack(anchor=tk.W, padx=4, pady=(2, 0))
 
-        # ── 장애 이력 테이블 ──────────────────────────────────────────
-        ttk.Label(parent,
+        ttk.Label(t1,
             text="  Ping 실패 / NCAgent 종료 / 네트워크 오류 / Windows 이벤트 오류 자동 기록",
             foreground="#555555").pack(anchor=tk.W, pady=(4, 2))
-        self._fault_tree = self._make_tree(parent,
+        self._fault_tree = self._make_tree(t1,
             ("dt","ftype","cause","detail"),
             ("발생시간","유형","원인","상세내용"),
             (155, 110, 200, 380))
-        self._add_save_bar(parent, self._fault_tree, "장애 분석", "fault_log")
+        self._add_save_bar(t1, self._fault_tree, "장애 분석", "fault_log")
+
+        # ── 탭2: 응답 누락 분석 테이블 ───────────────────────────────
+        ttk.Label(t2,
+            text="  연속 실패 횟수 기준으로 일시적 응답 누락 / 실제 장애를 자동 판별합니다."
+                 "  ■ 노란색 = 일시적 누락  ■ 빨간색 = 실제 장애  ■ 보라색 = 공통 구간",
+            foreground="#555555", wraplength=800, justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=8, pady=(6, 2))
+
+        self._analysis_tree = self._make_tree(t2,
+            ("ts","name","streak","dur","svr","eq","verdict","cause","action"),
+            ("분석시간","설비명","연속실패","지속시간","서버Ping","설비Ping",
+             "판정","추정원인","권장조치"),
+            (135, 80, 60, 70, 60, 65, 150, 200, 230))
+
+        self._analysis_tree.tag_configure(
+            "TRANSIENT", foreground="#b87a00")
+        self._analysis_tree.tag_configure(
+            "FAULT",     foreground="#cc0000", font=("", 9, "bold"))
+        self._analysis_tree.tag_configure(
+            "COMMON",    foreground="#7700aa", font=("", 9, "bold"))
+
+        self._add_save_bar(t2, self._analysis_tree, "응답 누락 분석", "analysis_log")
 
     # ── 공통 트리/저장 ────────────────────────────────────────────────
     @staticmethod
@@ -918,10 +1086,22 @@ class PingMonitorApp:
             messagebox.showerror("저장 실패", str(e))
 
     # ── 대상 관리 ─────────────────────────────────────────────────────
+    @staticmethod
+    def _t(entry) -> tuple:
+        """target 항목(dict 또는 tuple)에서 (name, host, role) 반환."""
+        if isinstance(entry, dict):
+            return entry.get("name",""), entry.get("host",""), entry.get("role","equipment")
+        if isinstance(entry, (list, tuple)):
+            name = entry[0] if len(entry) > 0 else ""
+            host = entry[1] if len(entry) > 1 else ""
+            return name, host, "equipment"
+        return str(entry), "", "equipment"
+
     def _reload_target_tree(self):
         self._target_tree.delete(*self._target_tree.get_children())
-        for name, ip in self._targets:
-            self._target_tree.insert("", tk.END, values=(name, ip))
+        for t in self._targets:
+            name, host, _ = self._t(t)
+            self._target_tree.insert("", tk.END, values=(name, host))
 
     def _add_target(self):
         dlg = TargetDialog(self.root)
@@ -935,7 +1115,9 @@ class PingMonitorApp:
         if not sel:
             return
         idx = self._target_tree.index(sel[0])
-        if messagebox.askyesno("삭제 확인", f"'{self._targets[idx][0]}' 삭제하시겠습니까?"):
+        t0 = self._targets[idx]
+        t0_name = str(t0[0]) if isinstance(t0,(list,tuple)) else t0.get("name","")
+        if messagebox.askyesno("삭제 확인", f"'{t0_name}' 삭제하시겠습니까?"):
             self._targets.pop(idx)
             self._reload_target_tree()
 
@@ -944,7 +1126,9 @@ class PingMonitorApp:
         if not sel:
             return
         idx = self._target_tree.index(sel[0])
-        name, ip = self._targets[idx]
+        te  = self._targets[idx]
+        name = str(te[0]) if isinstance(te,(list,tuple)) else te.get("name","")
+        ip   = str(te[1]) if isinstance(te,(list,tuple)) and len(te)>1 else te.get("host","")
         dlg = TargetDialog(self.root, name=name, ip=ip, title="대상 수정")
         self.root.wait_window(dlg)
         if dlg.result:
@@ -1367,6 +1551,10 @@ class PingMonitorApp:
         # 락 밖에서 파일 IO 수행
         self._generate_daily_report(snap)
         self._generate_excel_report(snap)
+        # 응답 누락 분석 집계 초기화
+        self._analysis_today.update(
+            {"total": 0, "transient": 0, "fault": 0,
+             "max_streak": 0, "max_dur": 0, "common": False})
         self.root.after(0, self._refresh_stat_labels)
 
     # ── 대시보드 통계 갱신 ────────────────────────────────────────────
@@ -1390,11 +1578,13 @@ class PingMonitorApp:
     def _update_cause_panel(self):
         """장애 원인 추정 패널을 현재 상태로 갱신."""
         try:
-            targets     = list(self._targets)
-            eq_host     = targets[0][1] if targets               else None
-            sv_host     = targets[1][1] if len(targets) > 1      else None
-            eq_name     = targets[0][0] if targets               else "설비"
-            sv_name     = targets[1][0] if len(targets) > 1      else "서버"
+            targets = list(self._targets)
+            def _host(t): return str(t[1]) if isinstance(t,(list,tuple)) else t.get("host","")
+            def _name(t): return str(t[0]) if isinstance(t,(list,tuple)) else t.get("name","")
+            eq_host = _host(targets[0]) if targets           else None
+            sv_host = _host(targets[1]) if len(targets) > 1  else None
+            eq_name = _name(targets[0]) if targets           else "설비"
+            sv_name = _name(targets[1]) if len(targets) > 1  else "서버"
 
             eq_ok  = self._prev_ok.get(eq_host,  True) if eq_host  else True
             sv_ok  = self._prev_ok.get(sv_host,  True) if sv_host  else True
@@ -1442,13 +1632,59 @@ class PingMonitorApp:
 
     # ── 모니터링 루프들 ───────────────────────────────────────────────
     def _ping_loop(self):
+        """
+        지수 백오프 + 영구 자동 복구.
+        - 30초 이상 정상 실행 후 예외 발생 → 일시적 오류로 간주, streak 리셋
+        - 연속 실패 시 2→4→8→...→300초 간격으로 재시도 (영구 중단 없음)
+        """
+        fail_streak  = 0
+        MAX_BACKOFF  = 300  # 최대 5분 대기
+
         while self._running:
-            now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            body_start = time.monotonic()
+            try:
+                self._ping_loop_body()
+                # 정상 종료 (self._running = False) → 루프 자연 종료
+            except Exception as e:
+                if self._sys_log:
+                    self._sys_log.log("_ping_loop", e)
+
+                # 30초 이상 정상 실행 후 실패 → 일시적 오류, streak 리셋
+                if time.monotonic() - body_start > 30:
+                    fail_streak = 0
+
+                fail_streak += 1
+                wait = min(2 * (2 ** min(fail_streak - 1, 7)), MAX_BACKOFF)
+                msg  = (f"[경고] Ping 루프 오류 ({fail_streak}회 연속). "
+                        f"{wait:.0f}초 후 자동 재시도...")
+                self.root.after(0, lambda m=msg: self._safe_status(m))
+                self._last_ping_time = time.monotonic()  # watchdog 갱신
+                time.sleep(wait)
+
+    def _ping_loop_body(self):
+        while self._running:
+            now_dt   = datetime.now()
+            now      = now_dt.strftime("%Y-%m-%d %H:%M:%S")
             snapshot = list(self._targets)
 
+            # ── Watchdog heartbeat ────────────────────────────────────
+            self._last_ping_time = time.monotonic()
+
+            # ── 절전 복귀(시간 점프) 감지 ────────────────────────────
+            exp = self._next_cycle_exp
+            if exp is not None:
+                jump_sec = (now_dt - exp).total_seconds()
+                if jump_sec > max(self._interval.get() * 3, 30):
+                    # 예상보다 30초+ 늦음 → 절전 복귀 추정
+                    self._start_grace_period(45)
+            self._next_cycle_exp = (now_dt +
+                                    timedelta(seconds=self._interval.get()))
+
             # ── 이번 사이클 Ping 결과 수집 ────────────────────────────
+            prev_snapshot = dict(self._prev_ok)
             results = []
-            for i, (name, host) in enumerate(snapshot):
+            for i, t in enumerate(snapshot):
+                name, host, role = self._t(t)
                 if not self._running:
                     break
                 ok, rt = self._ping(host)
@@ -1471,8 +1707,8 @@ class PingMonitorApp:
                         self._stats.sum_rt   += rt
                         self._stats.rt_count += 1
 
-            # ── UI 업데이트 + 장애 기록 + 지속시간 계산 ─────────────────
-            now_dt   = datetime.now()
+            # ── UI 업데이트 + 장애 기록 + FaultEngine 업데이트 ──────────
+            # now_dt는 루프 시작부에서 이미 정의됨
             any_fail = any(not ok for _, _, _, ok, _ in results)
 
             for i, name, host, ok, rt in results:
@@ -1480,50 +1716,111 @@ class PingMonitorApp:
                 rt_val  = rt if rt is not None else ""
                 rt_disp = f"{rt} ms" if rt is not None else "시간초과"
 
-                self._wcsv(self._ping_path, [now, host, status, rt_val])
+                # CSV 로그 (core.py CsvLogger 또는 기존 방식)
+                if self._csv_log:
+                    self._csv_log.write_ping(name, host, ok, rt)
+                else:
+                    self._wcsv(self._ping_path, [now, host, status, rt_val])
 
                 prev_ok = self._prev_ok.get(host, True)
 
-                if not ok:
-                    cause = "설비 Ping FAIL" if i == 0 else "서버 Ping FAIL"
-                    self._record_fault(now, "Ping 실패", cause, f"{host} 응답 없음")
+                # FaultEngine 업데이트 → 상태 변경 이벤트 처리
+                eng    = self._engines.get(host) if _CORE_OK else None
+                events = eng.update(ok, rt, now_dt) if eng else []
+                eng_state = eng.state if eng else (status)
 
-                    if prev_ok:                          # OK → FAIL (장애 시작)
-                        self._fail_start[host] = now_dt
-                        # 스크린샷 (별도 스레드)
-                        threading.Thread(target=self._take_screenshot,
-                                         daemon=True).start()
-                        self.root.after(0, lambda: self._set_led("led_status", "#ff3333"))
+                for ev in events:
+                    etype = ev.get("type", "")
+                    grace = self._in_grace_period()   # 절전 복귀 유예 기간
 
-                elif not prev_ok:                        # FAIL → OK (복구)
-                    start_dt = self._fail_start.pop(host, None)
-                    if start_dt:
-                        sec = int((now_dt - start_dt).total_seconds())
-                        dur = (f"{sec//60}분 {sec%60}초" if sec >= 60
-                               else f"{sec}초")
+                    if etype == "FAULT":
+                        if grace:
+                            # 유예 기간 중: ping_log에만 기록, fault/스크린샷 생략
+                            self.root.after(0, lambda: self._safe_status(
+                                f"[유예기간] 절전 복귀 후 네트워크 초기화 중..."))
+                        else:
+                            self._record_fault(now, "장애 발생",
+                                               f"{name} {eng_state}",
+                                               f"{host} 연속 {ev.get('fail_streak',0)}회 실패")
+                            threading.Thread(target=self._take_screenshot,
+                                             daemon=True).start()
+                            self.root.after(0, lambda:
+                                self._set_led("led_status", "#ff3333"))
+                    elif etype == "SUSPECT":
+                        if not grace:
+                            self._record_fault(now, "장애 의심",
+                                               f"{name} 연속 {ev.get('fail_streak',0)}회 실패",
+                                               host)
+                    elif etype == "RECOVERED":
+                        dur_s = ev.get("duration", 0)
+                        dur   = (f"{dur_s//60}분 {dur_s%60}초"
+                                 if dur_s >= 60 else f"{dur_s}초")
                         rec_row = [now, "Ping 복구", f"{name} 복구",
                                    f"{host}  |  지속시간: {dur}"]
                         self._wcsv(self._fault_path, rec_row)
                         self.root.after(0, lambda r=rec_row:
                             self._append_ui(self._fault_tree, r, "OK"))
-                    # 모든 대상 복구 시 Status → yellow
-                    if not any_fail:
-                        self.root.after(0, lambda:
-                            self._set_led("led_status", "#ffcc00"))
+                        if not any_fail:
+                            self.root.after(0, lambda:
+                                self._set_led("led_status", "#ffcc00"))
+
+                # core 없는 경우 기존 방식도 유지
+                if not _CORE_OK:
+                    if not ok:
+                        cause = "설비 Ping FAIL" if i == 0 else "서버 Ping FAIL"
+                        self._record_fault(now, "Ping 실패", cause,
+                                           f"{host} 응답 없음")
+                        if prev_ok:
+                            self._fail_start[host] = now_dt
+                            threading.Thread(target=self._take_screenshot,
+                                             daemon=True).start()
+                            self.root.after(0, lambda:
+                                self._set_led("led_status", "#ff3333"))
+                    elif not prev_ok:
+                        start_dt = self._fail_start.pop(host, None)
+                        if start_dt:
+                            sec = int((now_dt - start_dt).total_seconds())
+                            dur = (f"{sec//60}분 {sec%60}초" if sec >= 60
+                                   else f"{sec}초")
+                            rec_row = [now, "Ping 복구", f"{name} 복구",
+                                       f"{host}  |  지속시간: {dur}"]
+                            self._wcsv(self._fault_path, rec_row)
+                            self.root.after(0, lambda r=rec_row:
+                                self._append_ui(self._fault_tree, r, "OK"))
+                        if not any_fail:
+                            self.root.after(0, lambda:
+                                self._set_led("led_status", "#ffcc00"))
 
                 self._prev_ok[host] = ok
 
                 dk = "equip_status" if i == 0 else "server_status"
                 dr = "equip_detail" if i == 0 else "server_detail"
 
-                def _upd(s=status, rd=rt_disp, k=dk, kr=dr, n=now, h=host, rv=rt_val):
+                eng_ref = self._engines.get(host) if _CORE_OK else None
+
+                def _upd(s=status, rd=rt_disp, k=dk, kr=dr,
+                         n=now, h=host, rv=rt_val, er=eng_ref):
                     try:
-                        self._append_ui(self._ping_tree, [n, h, s, str(rv)], s)
-                        self._dash[k].config(text=s,
-                            foreground="#006600" if s == "OK" else "#cc0000")
-                        self._dash[kr].config(text=rd)
-                    except Exception:
-                        pass
+                        tag = s if not er else (
+                            "OK"   if er.state == FaultEngine.S_NORMAL else
+                            "WARN" if er.state in (FaultEngine.S_MISS,
+                                                   FaultEngine.S_SUSPECT) else "FAIL")
+                        self._append_ui(self._ping_tree, [n, h, s, str(rv)], tag)
+                        disp_text = er.state if er else s
+                        disp_fg   = er.fg_color if er else (
+                            "#006600" if s == "OK" else "#cc0000")
+                        disp_bg   = er.bg_color if er else "#FFFFFF"
+                        self._dash[k].config(text=disp_text,
+                                             foreground=disp_fg,
+                                             background=disp_bg)
+                        detail = rd
+                        if er:
+                            detail = (f"{rd}  연속실패:{er.fail_streak}"
+                                      if er.fail_streak > 0 else rd)
+                        self._dash[kr].config(text=detail)
+                    except Exception as exc:
+                        if self._sys_log:
+                            self._sys_log.log("_upd_dashboard", exc)
 
                 self.root.after(0, _upd)
 
@@ -1535,6 +1832,7 @@ class PingMonitorApp:
 
             self.root.after(0, self._refresh_stat_labels)
             self.root.after(0, self._refresh_graphs)
+            self._analyze_streaks(results, now_dt, prev_snapshot)
             self._check_day_rollover()
 
             if self._running:
@@ -1613,80 +1911,184 @@ class PingMonitorApp:
             pass
 
     # ── 로그 자동 정리 ────────────────────────────────────────────────
-    _ARCHIVE_TARGETS = [
+    # 아카이브 대상 CSV 파일 (헤더 상수 이름)
+    _ARCHIVE_CSV = [
         ("ping_log.csv",    "H_PING"),
         ("process_log.csv", "H_PROC"),
         ("network_log.csv", "H_NET"),
         ("event_log.csv",   "H_EVT"),
         ("fail_log.csv",    "H_FAULT"),
+        ("fault_log.csv",   "H_FAULT"),   # core.py 새 형식
+        ("agent_log.csv",   "H_PROC"),    # core.py 새 형식
     ]
 
     def _archive_old_logs(self):
-        """보관 기간이 지난 로그 항목을 archive 폴더로 이동."""
+        """
+        보관 기간 초과 로그를 archive 폴더로 이동 (Streaming + _log_lock).
+        메모리에 전체 파일을 올리지 않고 임시 파일 방식으로 처리.
+        """
         days    = self._retention_days.get()
         cutoff  = datetime.now() - timedelta(days=days)
         arc_dir = os.path.join(self._ld, "archive")
+        total   = 0
 
-        total_archived = 0
+        for fname, hdr_name in self._ARCHIVE_CSV:
+            total += self._archive_csv_stream(fname, hdr_name, cutoff, arc_dir)
 
-        for fname, hdr_name in self._ARCHIVE_TARGETS:
-            src = os.path.join(self._ld, fname)
-            if not os.path.exists(src):
-                continue
+        total += self._archive_error_log(cutoff, arc_dir)
+        total += self._archive_screenshots(cutoff)
+        return total
 
-            hdr = globals().get(hdr_name, [])
+    def _archive_csv_stream(self, fname, hdr_name, cutoff, arc_dir):
+        """단일 CSV를 스트리밍 방식으로 아카이브 (파일 전체를 메모리에 올리지 않음)."""
+        src = os.path.join(self._ld, fname)
+        if not os.path.exists(src):
+            return 0
 
-            try:
-                with open(src, "r", encoding="utf-8-sig", newline="") as f:
-                    reader = csv.reader(f)
-                    file_hdr = next(reader, [])
-                    rows     = list(reader)
-            except Exception:
-                continue
+        tmp          = src + ".archtmp"
+        arc_handles  = {}   # month -> (file_obj, csv_writer)
+        archived     = 0
+        default_hdr  = globals().get(hdr_name, [])
 
-            old_rows, new_rows = [], []
-            for row in rows:
-                if not row:
-                    continue
-                try:
-                    dt = datetime.strptime(row[0][:19], "%Y-%m-%d %H:%M:%S")
-                    (old_rows if dt < cutoff else new_rows).append(row)
-                except (ValueError, IndexError):
-                    new_rows.append(row)
-
-            if not old_rows:
-                continue
-
+        try:
             os.makedirs(arc_dir, exist_ok=True)
-
-            # 월별로 묶어서 archive 저장
-            monthly = {}
-            for row in old_rows:
+            with self._log_lock:  # Ping 쓰기 스레드 차단 후 atomic 처리
+                fin  = open(src, "r", encoding="utf-8-sig", newline="")
+                ftmp = open(tmp, "w", encoding="utf-8-sig", newline="")
                 try:
-                    month = row[0][:7].replace("-", "")   # YYYYMM
-                    monthly.setdefault(month, []).append(row)
+                    reader   = csv.reader(fin)
+                    writer   = csv.writer(ftmp)
+                    file_hdr = next(reader, None) or default_hdr
+                    writer.writerow(file_hdr)
+
+                    for row in reader:
+                        if not row:
+                            continue
+                        try:
+                            dt = datetime.strptime(row[0][:19], "%Y-%m-%d %H:%M:%S")
+                        except (ValueError, IndexError):
+                            writer.writerow(row)  # 날짜 없는 행은 유지
+                            continue
+
+                        if dt < cutoff:
+                            month = row[0][:7].replace("-", "")
+                            if month not in arc_handles:
+                                arc_p  = os.path.join(arc_dir,
+                                    f"{fname.replace('.csv','')}"
+                                    f"_{month}.csv")
+                                exists = os.path.exists(arc_p)
+                                fh     = open(arc_p, "a",
+                                              encoding="utf-8-sig", newline="")
+                                aw     = csv.writer(fh)
+                                if not exists:
+                                    aw.writerow(file_hdr)
+                                arc_handles[month] = (fh, aw)
+                            arc_handles[month][1].writerow(row)
+                            archived += 1
+                        else:
+                            writer.writerow(row)
+                finally:
+                    fin.close()
+                    ftmp.close()
+                    for fh, _ in arc_handles.values():
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+
+                if archived > 0:
+                    os.replace(tmp, src)
+                else:
+                    os.remove(tmp)
+
+        except Exception as e:
+            if self._sys_log:
+                self._sys_log.log("_archive_csv_stream", e, fname)
+            for cleanup in [tmp]:
+                try:
+                    if os.path.exists(cleanup):
+                        os.remove(cleanup)
                 except Exception:
                     pass
 
-            for month, m_rows in monthly.items():
-                arc_name = f"{fname.replace('.csv', '')}_{month}.csv"
-                arc_path = os.path.join(arc_dir, arc_name)
-                exists   = os.path.exists(arc_path)
-                with open(arc_path, "a", newline="", encoding="utf-8-sig") as f:
-                    w = csv.writer(f)
-                    if not exists:
-                        w.writerow(hdr or file_hdr)
-                    w.writerows(m_rows)
+        return archived
 
-            # 원본 파일을 최신 항목만 남기고 재작성
-            with open(src, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f)
-                w.writerow(file_hdr or hdr)
-                w.writerows(new_rows)
+    def _archive_error_log(self, cutoff, arc_dir):
+        """system_error.log에서 오래된 블록을 archive로 이동."""
+        src = os.path.join(self._ld, "system_error.log")
+        if not os.path.exists(src):
+            return 0
 
-            total_archived += len(old_rows)
+        tmp      = src + ".archtmp"
+        archived = 0
 
-        return total_archived
+        try:
+            os.makedirs(arc_dir, exist_ok=True)
+            with self._log_lock:
+                old_lines, new_lines = [], []
+                cur_block  = []
+                cur_is_old = False
+
+                with open(src, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.startswith("[20") and len(line) > 20:
+                            if cur_block:
+                                (old_lines if cur_is_old else new_lines).extend(cur_block)
+                            try:
+                                ts = datetime.strptime(line[1:20], "%Y-%m-%d %H:%M:%S")
+                                cur_is_old = ts < cutoff
+                            except (ValueError, IndexError):
+                                cur_is_old = False
+                            cur_block = [line]
+                        else:
+                            cur_block.append(line)
+                    if cur_block:
+                        (old_lines if cur_is_old else new_lines).extend(cur_block)
+
+                if old_lines:
+                    month = old_lines[0][1:8].replace("-", "")
+                    arc_p = os.path.join(arc_dir, f"system_error_{month}.log")
+                    with open(arc_p, "a", encoding="utf-8") as f:
+                        f.writelines(old_lines)
+                    archived = sum(1 for l in old_lines if l.startswith("[20"))
+
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+                os.replace(tmp, src)
+
+        except Exception as e:
+            if self._sys_log:
+                self._sys_log.log("_archive_error_log", e)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+        return archived
+
+    def _archive_screenshots(self, cutoff):
+        """보관 기간 초과 스크린샷 PNG 자동 삭제."""
+        sdir    = os.path.join(self._ld, "screenshots")
+        deleted = 0
+        if not os.path.isdir(sdir):
+            return 0
+        try:
+            for fname in os.listdir(sdir):
+                if not fname.lower().endswith(".png"):
+                    continue
+                fpath = os.path.join(sdir, fname)
+                try:
+                    mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+                    if mtime < cutoff:
+                        os.remove(fpath)
+                        deleted += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            if self._sys_log:
+                self._sys_log.log("_archive_screenshots", e)
+        return deleted
 
     def _run_archive_now(self):
         """'지금 정리' 버튼 → 별도 스레드에서 실행."""
@@ -1719,11 +2121,225 @@ class PingMonitorApp:
                     return
                 time.sleep(60)
 
+    # ── 응답 누락 분석 ────────────────────────────────────────────────
+    def _analyze_streaks(self, results, now_dt, prev_snapshot):
+        """연속 실패 그룹을 추적하고, 복구 시 자동 분류."""
+        if not results:
+            return
+
+        targets    = list(self._targets)
+        result_map = {host: ok for _, _, host, ok, _ in results}
+
+        # 이번 사이클에 전체 대상이 동시 실패했는지 확인
+        all_fail = (len(results) > 1 and
+                    all(not ok for _, _, _, ok, _ in results))
+
+        for i, t in enumerate(targets):
+            # tuple / dict / list 모두 지원
+            if isinstance(t, (list, tuple)):
+                name, host = str(t[0]), str(t[1]) if len(t) > 1 else ""
+            else:
+                name, host = t.get("name",""), t.get("host","")
+
+            if host not in result_map:
+                continue
+            ok      = result_map[host]
+            was_ok  = prev_snapshot.get(host, True)
+
+            if not ok:
+                if was_ok:                      # OK → FAIL : 연속 실패 시작
+                    self._streak_count[host]  = 1
+                    self._streak_start[host]  = now_dt
+                    self._streak_simul[host]  = all_fail
+                    # 서버 Ping 상태 기록 (설비 자신이 아닌 다른 첫 번째 대상)
+                    def _get_host(tt):
+                        return str(tt[1]) if isinstance(tt,(list,tuple)) else tt.get("host","")
+                    other = next((_get_host(targets[j]) for j in range(len(targets)) if j != i), None)
+                    self._streak_svr_ok[host] = result_map.get(other, True) if other else True
+                else:                           # FAIL 지속
+                    self._streak_count[host] = self._streak_count.get(host, 0) + 1
+                    if all_fail:
+                        self._streak_simul[host] = True
+            else:
+                if not was_ok:                  # FAIL → OK : 복구 → 분류
+                    streak   = self._streak_count.get(host, 1)
+                    start    = self._streak_start.get(host, now_dt)
+                    svr_ok   = self._streak_svr_ok.get(host, True)
+                    simul    = self._streak_simul.get(host, False)
+                    dur_sec  = max(1, int((now_dt - start).total_seconds()))
+                    self._record_analysis(name, host, streak, dur_sec,
+                                          svr_ok, simul, start, now_dt)
+                    for d in (self._streak_count, self._streak_start,
+                              self._streak_svr_ok, self._streak_simul):
+                        d.pop(host, None)
+
+    def _record_analysis(self, name, host, streak, dur_sec,
+                          svr_ok, simul, fail_start, fail_end):
+        """분석 결과 분류 후 테이블·요약 업데이트."""
+        ts_str   = fail_end.strftime("%Y-%m-%d %H:%M:%S")
+        dur_str  = (f"{dur_sec//60}분 {dur_sec%60}초"
+                    if dur_sec >= 60 else f"{dur_sec}초")
+        svr_text = "정상" if svr_ok else "실패"
+        eq_text  = "실패→복구"
+
+        # ── 판정 ──────────────────────────────────────────────────
+        if simul or not svr_ok:
+            verdict = "공통 구간 장애 가능성"
+            cause   = ("서버·설비 Ping 동시 실패\n"
+                       "→ PC/랜어댑터 또는 상위 네트워크 문제 가능성")
+            action  = "공유기·스위치 재시작, PC 네트워크 설정 확인"
+            tag     = "COMMON"
+        elif streak <= 2:
+            verdict = (f"{streak}회 실패 후 즉시 복구 — 일시적 응답 누락")
+            cause   = "패킷 순간 손실 (네트워크 혼잡 또는 일시적 지연)"
+            action  = "빈도 증가 시 점검 권장, 현재는 지속 모니터링"
+            tag     = "TRANSIENT"
+        else:
+            verdict = (f"{streak}회 연속 실패 — 실제 네트워크 장애 가능성")
+            cause   = ("서버 Ping 정상, 설비 Ping 실패\n"
+                       "→ 설비/스위치/현장망 구간 문제 가능성")
+            action  = "설비 전원·케이블·스위치 포트 점검"
+            tag     = "FAULT"
+
+        # ── 오늘 집계 업데이트 ─────────────────────────────────────
+        self._analysis_today["total"] += 1
+        if tag == "TRANSIENT":
+            self._analysis_today["transient"] += 1
+        else:
+            self._analysis_today["fault"] += 1
+        self._analysis_today["max_streak"] = max(
+            self._analysis_today["max_streak"], streak)
+        self._analysis_today["max_dur"] = max(
+            self._analysis_today["max_dur"], dur_sec)
+        if simul:
+            self._analysis_today["common"] = True
+
+        row = [ts_str, name, f"{streak}회", dur_str,
+               svr_text, eq_text, verdict, cause, action]
+
+        self.root.after(0, lambda r=row, t=tag: (
+            self._append_ui(self._analysis_tree, r, t),
+            self._update_analysis_summary_ui(),
+        ))
+
+    def _update_analysis_summary_ui(self):
+        """분석 요약 박스 레이블 업데이트."""
+        try:
+            a = self._analysis_today
+            self._dash["as_total"].config(text=str(a["total"]))
+            self._dash["as_transient"].config(
+                text=str(a["transient"]),
+                foreground="#cc8800" if a["transient"] > 0 else "#006600")
+            self._dash["as_fault"].config(
+                text=str(a["fault"]),
+                foreground="#cc0000" if a["fault"] > 0 else "#006600")
+            ms = a["max_streak"]
+            self._dash["as_max_streak"].config(
+                text=f"{ms}회" if ms > 0 else "—",
+                foreground="#cc0000" if ms >= 3 else "#333333")
+            md = a["max_dur"]
+            self._dash["as_max_dur"].config(
+                text=(f"{md//60}분 {md%60}초" if md >= 60 else f"{md}초")
+                if md > 0 else "—")
+            common = a["common"]
+            self._dash["as_common"].config(
+                text="발생" if common else "없음",
+                foreground="#cc0000" if common else "#006600")
+        except tk.TclError:
+            pass
+
     def _refresh_graphs(self):
         """그래프 갱신 — 메인 스레드에서 호출."""
         try:
             if self._graph_equip:  self._graph_equip.refresh()
             if self._graph_server: self._graph_server.refresh()
+        except tk.TclError:
+            pass
+
+    # ════════════════════════════════════════════════════════════════
+    # 24시간 안정성 메서드
+    # ════════════════════════════════════════════════════════════════
+
+    # ── 절전 복귀 Grace Period ────────────────────────────────────
+    def _start_grace_period(self, duration: int = 45) -> None:
+        """절전 복귀 후 N초 동안 FAULT 판정·스크린샷·알람 금지."""
+        self._grace_until = datetime.now() + timedelta(seconds=duration)
+        self.root.after(0, lambda d=duration: self._safe_status(
+            f"[절전 복귀 감지] {d}초 유예 기간 적용 — FAULT 판정 보류"))
+
+    def _in_grace_period(self) -> bool:
+        return (self._grace_until is not None
+                and datetime.now() < self._grace_until)
+
+    # ── 비정상 종료 감지 ──────────────────────────────────────────
+    def _mark_running(self) -> None:
+        """프로그램 실행 중 마킹 파일 생성."""
+        try:
+            with open(_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
+
+    def _clear_running(self) -> None:
+        """정상 종료 시 마킹 파일 삭제."""
+        try:
+            if os.path.exists(_FLAG_FILE):
+                os.remove(_FLAG_FILE)
+        except Exception:
+            pass
+
+    def _check_previous_crash(self) -> None:
+        """이전 비정상 종료 여부 확인 → UI에 알림."""
+        if not os.path.exists(_FLAG_FILE):
+            return
+        try:
+            with open(_FLAG_FILE, encoding="utf-8") as f:
+                prev = f.read().strip()
+        except Exception:
+            prev = "알 수 없음"
+        # 마킹 파일 삭제 (다음 실행에서 중복 알림 방지)
+        self._clear_running()
+        self.root.after(800, lambda: messagebox.showwarning(
+            "이전 세션 비정상 종료",
+            f"이전 실행이 정상 종료되지 않았습니다.\n"
+            f"마지막 실행 시각: {prev}\n\n"
+            f"로그 파일을 확인하세요: {self._ld}"))
+
+    # ── 1분마다 config 자동 저장 ──────────────────────────────────
+    def _periodic_config_save(self) -> None:
+        """1분마다 config.json 자동 저장 (강제 종료 대비)."""
+        try:
+            self._save_config()
+        except Exception:
+            pass
+        try:
+            self.root.after(60_000, self._periodic_config_save)
+        except tk.TclError:
+            pass
+
+    # ── 날짜 변경 감시 (모니터링 중지 중에도 작동) ────────────────
+    def _watch_day(self) -> None:
+        """1분마다 날짜 변경 확인 → 자정 롤오버 처리."""
+        try:
+            if self._stats.date != date.today():
+                self._check_day_rollover()
+        except Exception:
+            pass
+        try:
+            self.root.after(60_000, self._watch_day)
+        except tk.TclError:
+            pass
+
+    # ── Watchdog: Ping 루프 무응답 감지 ──────────────────────────
+    def _watchdog_check(self) -> None:
+        """15초마다 마지막 Ping 시각 확인 → 30초 무응답 시 경고."""
+        try:
+            if self._running:
+                elapsed = time.monotonic() - self._last_ping_time
+                if elapsed > 30:
+                    self._safe_status(
+                        f"[Watchdog] Ping 루프 {elapsed:.0f}초 무응답 — 자동 복구 대기 중")
+            self.root.after(15_000, self._watchdog_check)
         except tk.TclError:
             pass
 
@@ -1741,11 +2357,48 @@ class PingMonitorApp:
         if not self._log_dir.get().strip():
             messagebox.showwarning("알림", "로그 경로를 입력하세요.")
             return
+
+        # 설정 검증
+        if _CORE_OK:
+            cfg = {"targets": [{"name": self._t(t)[0], "host": self._t(t)[1]}
+                                for t in self._targets],
+                   "interval": self._interval.get()}
+            ok, errs = validate_config(cfg)
+            if not ok:
+                messagebox.showerror("설정 오류", "\n".join(errs))
+                return
+            warn = validate_interval_warn(self._interval.get())
+            if warn:
+                if not messagebox.askyesno("검사 주기 경고", warn + "\n\n계속 시작하시겠습니까?"):
+                    return
+
         try:
             self._ensure_logs()
         except Exception as e:
+            if self._sys_log:
+                self._sys_log.log("_start._ensure_logs", e)
             messagebox.showerror("오류", f"로그 폴더 생성 실패:\n{e}")
             return
+
+        # core 모듈 경로 업데이트
+        if _CORE_OK:
+            self._sys_log.update_path(self._ld)
+            self._csv_log.update_dir(self._ld)
+            rpt_dir = os.path.join(_SCRIPT_DIR, "reports")
+            os.makedirs(rpt_dir, exist_ok=True)
+            self._reporter.update_dir(rpt_dir)
+
+        # FaultEngine 생성 (대상별)
+        if _CORE_OK:
+            self._engines.clear()
+            roles = getattr(self, "_target_roles", {})
+            for i, t in enumerate(self._targets):
+                name = str(t[0]) if isinstance(t, (list, tuple)) else t.get("name","")
+                host = str(t[1]) if isinstance(t, (list, tuple)) else t.get("host","")
+                role = roles.get(host, "equipment" if i == 0 else "server")
+                if host:
+                    self._engines[host] = FaultEngine(
+                        name, host, role, self._fault_policy, self._csv_log)
 
         self._running = True
         self._threads.clear()
@@ -1767,6 +2420,16 @@ class PingMonitorApp:
 
         self._set_led("led_power",  "#00dd44")  # 녹색
         self._set_led("led_status", "#ffcc00")  # 노란색
+
+        # 비정상 종료 감지 마킹
+        self._mark_running()
+        # 1분마다 config 자동 저장
+        self.root.after(60_000, self._periodic_config_save)
+        # Watchdog 시작
+        self.root.after(15_000, self._watchdog_check)
+        # next_cycle 초기화 (sleep 감지 오탐 방지)
+        self._next_cycle_exp = None
+
         self._status_bar.config(text=f"모니터링 시작  —  로그: {self._ld}")
 
     def _stop(self):
@@ -1789,12 +2452,89 @@ class PingMonitorApp:
         self._archive_btn.config(state=tk.NORMAL)
 
     def _on_close(self):
+        # 모니터링 중일 때만 확인 다이얼로그 표시
+        if self._running:
+            dlg = tk.Toplevel(self.root)
+            dlg.title("종료 확인")
+            dlg.resizable(False, False)
+            dlg.grab_set()
+            dlg.transient(self.root)
+
+            ttk.Label(dlg,
+                      text="모니터링이 실행 중입니다.\n정말 종료하시겠습니까?",
+                      font=("", 10), justify=tk.CENTER,
+                      padding=(20, 16)).pack()
+
+            ttk.Separator(dlg, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=12)
+
+            btn_row = ttk.Frame(dlg, padding=(0, 10))
+            btn_row.pack()
+
+            confirmed = [False]
+
+            def _yes():
+                confirmed[0] = True
+                dlg.destroy()
+
+            ttk.Button(btn_row, text="종료", command=_yes, width=12).pack(side=tk.LEFT, padx=8)
+            if self._tray and self._tray.available:
+                def _tray_min():
+                    dlg.destroy()
+                    self.root.withdraw()
+                    self._tray.start("핑감지 테스트기")
+                ttk.Button(btn_row, text="트레이 최소화",
+                           command=_tray_min, width=14).pack(side=tk.LEFT, padx=8)
+            ttk.Button(btn_row, text="취소", command=dlg.destroy, width=12).pack(side=tk.LEFT, padx=8)
+
+            dlg.bind("<Return>", lambda e: _yes())
+            dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+            # 창 중앙 배치
+            dlg.update_idletasks()
+            px = self.root.winfo_x() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+            py = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+            dlg.geometry(f"+{px}+{py}")
+
+            self.root.wait_window(dlg)
+
+            if not confirmed[0]:
+                return   # 취소 → 종료하지 않음
+
         self._running = False
+        if _CORE_OK and self._reporter and self._engines:
+            try:
+                self._reporter.generate(list(self._engines.values()))
+            except Exception as e:
+                if self._sys_log:
+                    self._sys_log.log("_on_close.reporter", e)
         self._generate_daily_report()
         self._generate_excel_report()
         self._save_config()
+        self._clear_running()   # 정상 종료 마킹 파일 삭제
+        if self._tray:
+            self._tray.stop()
         self.root.quit()
         self.root.destroy()
+
+    # ── 트레이 아이콘 콜백 ───────────────────────────────────────────
+    def _tray_show(self) -> None:
+        self.root.after(0, self.root.deiconify)
+        self.root.after(0, self.root.lift)
+
+    def _tray_quit(self) -> None:
+        self.root.after(0, self._on_close)
+
+    # ── 시작 프로그램 등록 UI (설정 스트립에서 호출) ─────────────────
+    def _toggle_startup(self) -> None:
+        if not _CORE_OK:
+            messagebox.showinfo("알림", "startup.py가 없어 이 기능을 사용할 수 없습니다.")
+            return
+        enabled = is_startup_enabled()
+        ok, msg = set_startup(not enabled)
+        if ok:
+            self._startup_btn.config(
+                text="자동 실행 해제" if not enabled else "시작 시 자동 실행")
+        messagebox.showinfo("자동 실행 설정", msg)
 
 
 # ── 아이콘 생성 ───────────────────────────────────────────────────────
