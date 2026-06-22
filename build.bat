@@ -4,31 +4,46 @@ title PingMonitor - EXE Build
 
 echo ============================================================
 echo   PingMonitor EXE Builder
-echo   Python is required only for building.
-echo   The output EXE runs on any Windows PC without Python.
+echo   Python required for build only.
+echo   Output EXE runs on any Windows PC without Python.
 echo ============================================================
 echo.
 
-:: Python 확인
+:: Python 탐색 (실행 bat와 동일 로직)
+set PYTHON_EXE=
+
 python --version > nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python not found.
-    echo Install: https://www.python.org/downloads/
-    echo Check "Add Python to PATH" during installation.
-    echo.
-    pause
-    exit /b 1
+if %errorlevel% equ 0 ( set PYTHON_EXE=python & goto :py_found )
+
+py --version > nul 2>&1
+if %errorlevel% equ 0 ( set PYTHON_EXE=py & goto :py_found )
+
+for /d %%P in ("%LOCALAPPDATA%\Programs\Python\Python3*") do (
+    if exist "%%P\python.exe" ( set "PYTHON_EXE=%%P\python.exe" & goto :py_found )
 )
 
+for /d %%P in ("C:\Python3*" "C:\Program Files\Python3*") do (
+    if exist "%%P\python.exe" ( set "PYTHON_EXE=%%P\python.exe" & goto :py_found )
+)
+
+echo [ERROR] Python not found.
+echo Install: https://www.python.org/downloads/
+pause
+exit /b 1
+
+:py_found
+echo   Python: %PYTHON_EXE%
+echo.
+
 echo [1/4] Installing PyInstaller and dependencies...
-pip install pyinstaller psutil openpyxl
+%PYTHON_EXE% -m pip install pyinstaller psutil openpyxl
 echo.
 
 echo [2/4] Generating icon...
-python generate_icon.py
+%PYTHON_EXE% generate_icon.py
 echo.
 
-echo [3/4] Building EXE (this may take 1-2 minutes)...
+echo [3/4] Building EXE (1-3 minutes)...
 pyinstaller --onefile ^
             --windowed ^
             --name "PingMonitor" ^
@@ -36,6 +51,10 @@ pyinstaller --onefile ^
             --hidden-import psutil ^
             --hidden-import psutil._psutil_windows ^
             --hidden-import psutil._psutil_common ^
+            --hidden-import core ^
+            --hidden-import startup ^
+            --add-data "core.py;." ^
+            --add-data "startup.py;." ^
             --collect-all psutil ^
             --collect-all openpyxl ^
             ping_monitor_gui.py
@@ -46,21 +65,14 @@ if exist "dist\PingMonitor.exe" (
     copy /y "dist\PingMonitor.exe" "PingMonitor.exe" > nul
     echo.
     echo ============================================================
-    echo   BUILD SUCCESS!
+    echo   BUILD SUCCESS
     echo.
-    echo   Output: PingMonitor\PingMonitor.exe
-    echo.
-    echo   [배포 방법]
-    echo   PingMonitor.exe 파일 하나만 복사하면 됩니다.
-    echo   어떤 Windows PC에서도 Python 없이 실행 가능합니다.
+    echo   PingMonitor.exe  <- copy this to any Windows PC
+    echo   No Python needed on target PC.
     echo ============================================================
 ) else (
-    echo.
-    echo [ERROR] Build failed. Check the output above for errors.
+    echo [ERROR] Build failed.
 )
 
-echo.
-echo Build temp files (build\, dist\, *.spec) are kept.
-echo You can delete them manually if not needed.
 echo.
 pause
